@@ -1,0 +1,575 @@
+"""에이전트 Tool 8종.
+
+모든 Tool 은 야간 배치 산출물(data/processed)을 조회만 하며,
+반환값에 근거 수치(표본 수, 기간, 정의)를 반드시 포함한다 — 환각 방지 (기획서 8장).
+"""
+from __future__ import annotations
+
+import json
+import math
+from datetime import date
+from functools import lru_cache
+
+import numpy as np
+import pandas as pd
+
+import config as C
+from core import address as A
+from core.cycle import classify_stage
+from core.survival import YEAR, summarize
+
+
+class ToolError(ValueError):
+    """사용자 입력으로 결과를 만들 수 없을 때 — 에이전트에게 is_error 로 전달된다."""
+
+
+# ─────────────────────────── 데이터 로딩 ───────────────────────────
+class DataStore:
+    def __init__(self, processed_dir=C.PROCESSED_DIR):
+        if not (processed_dir / "meta.json").exists():
+            raise FileNotFoundError(f"{processed_dir} 에 배치 산출물이 없습니다. `python -m pipeline.build` 를 먼저 실행하세요.")
+        rd = lambda n: pd.read_parquet(processed_dir / f"{n}.parquet")  # noqa: E731
+        self.meta = json.loads((processed_dir / "meta.json").read_text(encoding="utf-8"))
+        self.stores = rd("stores")
+        self.units = rd("units").set_index("uid", drop=False)
+        self.transitions = rd("transitions")
+        self.cycle = rd("area_cycle")
+        self.area_year = rd("area_year")
+        self.survival = rd("survival")
+        self.vacancy = rd("vacancy_area")
+        self.ref = pd.Timestamp(self.meta["reference_date"])
+        self.categories = sorted(self.stores["category"].unique())
+        self.dongs = self.units[["gu", "dong"]].dropna().drop_duplicates()
+
+
+@lru_cache(maxsize=1)
+def store() -> DataStore:
+    return DataStore()
+
+
+# ─────────────────────────── 공통 헬퍼 ───────────────────────────
+def _py(v):
+    """numpy / pandas 값을 JSON 직렬화 가능한 파이썬 값으로."""
+    if isinstance(v, dict):
+        return {k: _py(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_py(x) for x in v]
+    if isinstance(v, (pd.Timestamp, date)):
+        return None if pd.isna(v) else str(v.date() if isinstance(v, pd.Timestamp) else v)
+    if isinstance(v, np.generic):
+        v = v.item()
+    if isinstance(v, float) and math.isnan(v):
+        return None
+    if v is pd.NaT or v is pd.NA:
+        return None
+    return v
+
+
+def _basis(**extra) -> dict:
+    s = store()
+    return {"data": "행정안전부 지방행정 인허가(대구 일반·휴게음식점)", "reference_date": s.meta["reference_date"], **extra}
+
+
+def _resolve_area(gu: str | None = None, dong: str | None = None) -> tuple[str | None, list[str] | None, str]:
+    s = store()
+    g = A.normalize_gu(gu) if gu else None
+    if gu and not g and gu.strip().endswith(("구", "군")):
+        raise ToolError(f"'{gu}'는 대구의 구·군이 아닙니다 (중구, 동구, 서구, 남구, 북구, 수성구, 달서구, 달성군, 군위군).")
+    if gu and not g and not dong:  # 구 자리에 동 이름을 넣은 경우
+        dong = gu
+    d = None
+    if dong:
+        text = dong.replace(A.SIDO, "").replace("대구", "").strip()
+        parts = text.split()
+        if len(parts) > 1 and A.normalize_gu(parts[0]):
+            g = g or A.normalize_gu(parts[0])
+            text = parts[-1]
+        # '삼덕동' → 삼덕동(수성구) + 삼덕동1가~3가(중구) 모두 후보
+        names = s.dongs["dong"]
+        cand = s.dongs[(names == text) | names.str.startswith(text)]
+        if cand.empty:
+            cand = s.dongs[names.str.startswith(text.rstrip("동읍면"))]
+        if g:
+            cand = cand[cand["gu"] == g]
+        if cand.empty:
+            raise ToolError(f"'{dong}'에 해당하는 동·읍·면을 찾지 못했습니다 (법정동 기준, 예: 범어동, 삼덕동1가, 다사읍).")
+        if cand["gu"].nunique() > 1:
+            opts = cand.groupby("gu")["dong"].apply(lambda x: ", ".join(sorted(x))).to_dict()
+            raise ToolError(f"'{dong}'이(가) 여러 구에 있습니다: {opts}. 구를 함께 지정하세요.")
+        g = cand["gu"].iat[0]
+        d = sorted(cand["dong"].unique())
+    elif gu and not g:
+        raise ToolError(f"'{gu}'는 대구의 구·군이 아닙니다 (중구, 동구, 서구, 남구, 북구, 수성구, 달서구, 달성군, 군위군).")
+    label = "대구 전체" if not g else (g if not d else f"{g} {', '.join(d)}")
+    return g, d, label
+
+
+def _area_mask(df: pd.DataFrame, g, d) -> pd.Series:
+    m = pd.Series(True, index=df.index)
+    if g:
+        m &= df["gu"] == g
+    if d:
+        m &= df["dong"].isin(d)
+    return m
+
+
+def _resolve_category(text: str | None) -> tuple[str | None, list[str] | None, str]:
+    """반환: (service, categories, label). 업종명(일반/휴게음식점)과 업태·별칭 모두 허용."""
+    if not text:
+        return None, None, "전체 업태"
+    t = text.strip()
+    s = store()
+    if t in C.SERVICES:
+        return t, None, t
+    if t in s.categories:
+        return None, [t], t
+    key = t.replace(" ", "")
+    if key in C.CATEGORY_ALIASES:
+        cats = [c for c in C.CATEGORY_ALIASES[key] if c in s.categories]
+        if cats:
+            return None, cats, f"{t}({', '.join(cats)})"
+    cats = [c for c in s.categories if key in c.replace(" ", "")]
+    if cats:
+        return None, cats, f"{t}({', '.join(cats)})"
+    raise ToolError(f"업태 '{text}'를 찾지 못했습니다. 사용 가능한 업태: {', '.join(s.categories)}")
+
+
+def _cat_mask(df: pd.DataFrame, service, cats, cat_col="category", service_col="service") -> pd.Series:
+    m = pd.Series(True, index=df.index)
+    if service:
+        m &= df[service_col] == service
+    if cats:
+        m &= df[cat_col].isin(cats)
+    return m
+
+
+def _years(days) -> float | None:
+    return None if days is None or pd.isna(days) else round(float(days) / YEAR, 1)
+
+
+def _survival(frame: pd.DataFrame, curve=True) -> dict:
+    out = summarize(frame["dur_days"], frame["closed"])
+    if out["median_survival_years"] is None and out["n"]:
+        out["median_note"] = "관측기간 내 생존율이 50% 아래로 떨어지지 않음(중앙생존기간 추정 불가)"
+    if not curve:
+        out.pop("curve")
+    return out
+
+
+def _unit_brief(u: pd.Series) -> dict:
+    status = (f"영업중 {int(u['n_active'])}개 ({u['current_stores']})" if not u["vacant"]
+              else f"인허가 공백 {int(u['vacant_days'])}일째 (마지막 폐업 {u['last_close'].date()})")
+    return {
+        "unit_id": u["uid"], "address": u["addr"], "jibun_address": u["jibun_addr"], "floor": u["floor"],
+        "gu": u["gu"], "dong": u["dong"], "records": int(u["n_records"]), "status": status,
+        "lat": u["lat"], "lon": u["lon"],
+    }
+
+
+# ─────────────────────────── Tool 1. normalize_address ───────────────────────────
+def normalize_address(query: str, limit: int = 10) -> dict:
+    """주소·상호 문자열을 '자리(unit)' 후보로 정규화."""
+    s = store()
+    u = s.units
+    q = (query or "").strip()
+    if not q:
+        raise ToolError("주소 또는 상호를 입력하세요.")
+    floor = A.extract_floor(q)
+    hits, method = pd.Index([]), None
+
+    jb = A.parse_jibun(q if q.startswith("대구") else f"{A.SIDO} {q}")
+    if jb:
+        hits, method = u.index[u["building_key"] == jb["key"]], "지번 기본주소 일치"
+    if hits.empty:
+        rd = A.parse_road(q if q.startswith("대구") else f"{A.SIDO} {q}")
+        if rd:
+            uids = s.stores.loc[s.stores["road_key"] == rd["key"], "uid"].unique()
+            hits, method = pd.Index(uids), "도로명 기본주소 일치"
+    if hits.empty:
+        tokens = [t for t in q.replace(",", " ").split() if t not in ("대구", "대구시", A.SIDO)]
+        hay = u["addr"] + " " + u["jibun_addr"]
+        m = pd.Series(True, index=u.index)
+        for t in tokens:
+            m &= hay.str.contains(t, regex=False)
+        hits, method = u.index[m], "주소 토큰 포함 검색"
+    if hits.empty and len(q) >= 2:
+        uids = s.stores.loc[s.stores["name"].str.contains(q, regex=False), "uid"].unique()
+        hits, method = pd.Index(uids), "상호명 검색(과거 상호 포함)"
+    if hits.empty:
+        return _py({"query": query, "matched": 0, "matches": [],
+                    "hint": "도로명(예: 동성로5길 83) 또는 지번(예: 삼덕동1가 28-6) 형식으로 다시 시도하세요."})
+
+    cand = u.loc[hits]
+    if floor:
+        same = cand[cand["floor"] == floor]
+        cand = same if not same.empty else cand
+    cand = cand.sort_values("n_records", ascending=False)
+    return _py({
+        "query": query, "method": method, "matched": int(len(cand)),
+        "matches": [_unit_brief(r) for _, r in cand.head(limit).iterrows()],
+        "note": "자리(unit) = 건물 기본주소(지번) + 층. 층 기재가 없는 과거 레코드는 건물 내 주 사용 층으로 합산.",
+    })
+
+
+def _pick_unit(address: str) -> tuple[pd.Series, dict]:
+    res = normalize_address(address, limit=5)
+    if not res["matched"]:
+        raise ToolError(f"'{address}'에 해당하는 자리를 찾지 못했습니다. {res.get('hint', '')}")
+    uid = res["matches"][0]["unit_id"]
+    return store().units.loc[uid], res
+
+
+# ─────────────────────────── Tool 2. get_unit_history ───────────────────────────
+def get_unit_history(address: str, whole_building: bool = False, max_records: int = 40) -> dict:
+    """한 자리의 업종 변천 이력 + 업태별 존속기간."""
+    s = store()
+    u, res = _pick_unit(address)
+    key = "building_key" if whole_building else "uid"
+    recs = s.stores[s.stores[key] == u[key]].sort_values(["ld", "cd"])
+    prev_close, timeline = None, []
+    for _, r in recs.iterrows():
+        gap = (r["ld"] - prev_close).days if prev_close is not None else None
+        timeline.append({
+            "open": r["ld"], "close": r["cd"] if r["closed"] else "영업중",
+            "name": r["name"], "service": r["service"], "category": r["category"], "floor": r["floor"],
+            "years": _years(r["dur_days"]), "gap_from_previous_close_days": gap,
+        })
+        if r["closed"]:
+            prev_close = r["cd"] if prev_close is None else max(prev_close, r["cd"])
+
+    by_cat = (recs.groupby("category")
+              .agg(stores=("name", "size"), closed=("closed", "sum"), avg_years=("dur_days", "mean"),
+                   max_years=("dur_days", "max"))
+              .assign(avg_years=lambda d: (d["avg_years"] / YEAR).round(1),
+                      max_years=lambda d: (d["max_years"] / YEAR).round(1))
+              .sort_values("avg_years", ascending=False).reset_index())
+    daegu = s.survival[(s.survival["level"] == "업태") & s.survival["category"].isin(by_cat["category"])]
+    by_cat = by_cat.merge(daegu[["category", "median_survival_years"]]
+                          .rename(columns={"median_survival_years": "daegu_median_years_2010plus"}),
+                          on="category", how="left")
+
+    since = recs[recs["ld"].dt.year >= C.SURVIVAL_START_YEAR]
+    return _py({
+        "unit": _unit_brief(u) | {
+            "max_concurrent_stores": int(u["max_concurrent"]),
+            "is_single_unit": bool(u["is_single_unit"]),
+            "single_unit_note": None if u["is_single_unit"] else "동시에 여러 점포가 영업한 다점포 건물/층(푸드코트·백화점 등)이라 '한 자리'의 교체 이력으로 해석하면 안 됨",
+        },
+        "summary": {
+            "total_records": int(len(recs)), "closed": int(recs["closed"].sum()),
+            "active": int((~recs["closed"]).sum()),
+            "first_open": recs["ld"].min(), "closures_since_2010": int(since["closed"].sum()),
+            "avg_years_closed_since_2010": _years(since.loc[since["closed"], "dur_days"].mean()),
+            "category_path": " → ".join(recs["category"].tolist()[-12:]),
+        },
+        "by_category": by_cat.to_dict("records"),
+        "timeline": timeline[-max_records:],
+        "timeline_truncated": len(timeline) > max_records,
+        "other_candidates": res["matches"][1:],
+        "basis": _basis(definition="같은 자리(건물+층)의 인허가 레코드를 인허가일 순으로 정렬. gap = 직전 폐업일~이번 인허가일(음수는 양도·양수로 인한 중첩)."),
+    })
+
+
+# ─────────────────────────── Tool 3. get_survival_curve ───────────────────────────
+def get_survival_curve(category: str | None = None, gu: str | None = None, dong: str | None = None,
+                       since_year: int = C.SURVIVAL_START_YEAR, group_by: str | None = None,
+                       min_n: int = 100, top_n: int = 20) -> dict:
+    """Kaplan-Meier 생존곡선. group_by='category'|'gu'|'dong'|'service' 이면 그룹별 순위표."""
+    s = store()
+    service, cats, cat_label = _resolve_category(category)
+    g, d, area_label = _resolve_area(gu, dong)
+    since_year = int(since_year or C.SURVIVAL_START_YEAR)
+    st = s.stores
+    base = st[st["ld"].dt.year >= since_year]
+    frame = base[_area_mask(base, g, d) & _cat_mask(base, service, cats)]
+    caveat = ("2010년 이전 개업분은 전산화 이전 단명 업소 누락으로 생존율이 과대추정됨(1990년대 1년 생존율 99.9%)."
+              if since_year < C.SURVIVAL_START_YEAR else None)
+    basis = _basis(cohort=f"{since_year}년 이후 인허가", area=area_label, category=cat_label,
+                   method="Kaplan-Meier, 영업중 점포는 기준일에서 중도절단", caveat=caveat)
+
+    if group_by:
+        col = {"category": "category", "업태": "category", "gu": "gu", "구": "gu", "dong": "dong", "동": "dong",
+               "service": "service", "업종": "service"}.get(group_by)
+        if not col:
+            raise ToolError("group_by 는 category, gu, dong, service 중 하나입니다.")
+        rows = []
+        for key, f in frame.groupby(col):
+            if len(f) < min_n:
+                continue
+            sm = _survival(f, curve=False)
+            rows.append({col: key, **({"gu": f["gu"].iat[0]} if col == "dong" else {}), **sm})
+        # 중앙생존기간 미도달(None)은 가장 오래 버틴 그룹이므로 맨 앞
+        rows.sort(key=lambda r: -(r["median_survival_years"] if r["median_survival_years"] is not None else 99))
+        return _py({"group_by": col, "min_n": min_n, "groups": len(rows),
+                    "ranking_by_median_survival": rows[:top_n],
+                    "shortest": rows[-min(5, len(rows)):][::-1] if len(rows) > top_n else None,
+                    "overall": _survival(frame, curve=False), "basis": basis})
+
+    if len(frame) < C.MIN_GROUP_N:
+        raise ToolError(f"표본이 {len(frame)}건으로 너무 적습니다(최소 {C.MIN_GROUP_N}). 범위를 넓혀 주세요.")
+    result = _survival(frame)
+    baseline = _survival(base, curve=False)
+    return _py({
+        "target": f"{area_label} / {cat_label}", **result,
+        "daegu_baseline_same_cohort": {k: baseline[k] for k in ("n", "median_survival_years", "survival_1y_pct", "survival_3y_pct", "survival_5y_pct")},
+        "close_within_1y_pct": None if result["survival_1y_pct"] is None else round(100 - result["survival_1y_pct"], 1),
+        "basis": basis,
+    })
+
+
+# ─────────────────────────── Tool 4. get_market_cycle ───────────────────────────
+_CYCLE_COUNTS = ["open_recent", "close_recent", "open_prev", "close_prev", "active_now", "active_then"]
+
+
+def _cycle_for(g: str, d: list[str] | None) -> tuple[pd.Series, pd.DataFrame]:
+    """배치에서 계산한 사이클 행과 연도별 시계열. 여러 법정동(삼덕동1가~3가 등)은 합산 후 재판정."""
+    s = store()
+    cyc, ay = s.cycle, s.area_year
+    if not d:
+        return (cyc[(cyc["level"] == "구군") & (cyc["gu"] == g)].iloc[0],
+                ay[(ay["level"] == "구군") & (ay["gu"] == g)])
+    sub = cyc[(cyc["level"] == "동") & (cyc["gu"] == g) & cyc["dong"].isin(d)]
+    series = ay[(ay["level"] == "동") & (ay["gu"] == g) & ay["dong"].isin(d)]
+    if len(d) == 1:
+        return sub.iloc[0], series
+    counts = sub[_CYCLE_COUNTS].sum()
+    row = pd.Series({**counts.to_dict(), **classify_stage(*counts.tolist()),
+                     "window_recent": sub["window_recent"].iat[0], "window_prev": sub["window_prev"].iat[0]})
+    series = (series.groupby("year", as_index=False)[["opens", "closes", "active_end_of_year"]].sum()
+              .assign(partial_year=lambda x: x["year"] == s.ref.year))
+    return row, series
+
+
+def get_market_cycle(gu: str | None = None, dong: str | None = None, years: int = 10) -> dict:
+    """상권 사이클 단계(성장/회복/성숙/쇠퇴 진입/쇠퇴) + 근거 수치."""
+    s = store()
+    g, d, label = _resolve_area(gu, dong)
+    cyc, ay = s.cycle, s.area_year
+    cols = ["open_recent", "close_recent", "open_prev", "close_prev", "active_now", "active_then", "stage",
+            "stage_desc", "open_close_ratio_recent", "open_close_ratio_prev", "active_change_pct"]
+    rules = ("최근 3년 개업/폐업 비율 r, 직전 3년 rp: r≥1.1이면 성장기(rp<0.9면 회복기), 0.9≤r<1.1 성숙기, "
+             "r<0.9이면 쇠퇴기(rp≥0.9면 쇠퇴 진입기). 이벤트 20건 미만은 판정 보류.")
+
+    if not g:
+        row = cyc[cyc["level"] == "대구"].iloc[0]
+        gus = cyc[cyc["level"] == "구군"].sort_values("open_close_ratio_recent", ascending=False)
+        series = ay[ay["level"] == "대구"]
+        return _py({
+            "area": label, **row[cols].to_dict(),
+            "by_gu": gus[["gu"] + cols[:1] + cols[1:2] + ["stage", "open_close_ratio_recent", "active_change_pct"]].to_dict("records"),
+            "yearly": series[["year", "opens", "closes", "active_end_of_year", "partial_year"]].tail(years).to_dict("records"),
+            "basis": _basis(window_recent=row["window_recent"], window_prev=row["window_prev"], rule=rules),
+        })
+
+    row, series = _cycle_for(g, d)
+
+    # 최근 3년 업태별 순증감 (어떤 업종이 들어오고 나가는지)
+    st = s.stores[_area_mask(s.stores, g, d)]
+    t1 = s.ref - pd.DateOffset(years=C.CYCLE_WINDOW_YEARS)
+    mv = pd.DataFrame({
+        "opens": st[st["ld"] > t1].groupby("category").size(),
+        "closes": st[st["closed"] & (st["cd"] > t1)].groupby("category").size(),
+    }).fillna(0).astype(int)
+    mv["net"] = mv["opens"] - mv["closes"]
+    mv = mv[(mv["opens"] + mv["closes"]) >= 5].sort_values("net")
+
+    return _py({
+        "area": label, **row[cols].to_dict(),
+        "yearly": series[["year", "opens", "closes", "active_end_of_year", "partial_year"]].tail(years).to_dict("records"),
+        "categories_growing_recent_3y": mv.tail(5)[::-1].reset_index().to_dict("records"),
+        "categories_shrinking_recent_3y": mv.head(5).reset_index().to_dict("records"),
+        "basis": _basis(window_recent=row["window_recent"], window_prev=row["window_prev"], rule=rules,
+                        note=f"{s.ref.year}년은 {s.meta['reference_date']}까지의 부분 연도"),
+    })
+
+
+# ─────────────────────────── Tool 5. find_vacant_units ───────────────────────────
+def find_vacant_units(gu: str | None = None, dong: str | None = None, previous_category: str | None = None,
+                      min_days: int = C.VACANCY_MIN_DAYS, max_days: int = C.VACANCY_MAX_DAYS,
+                      single_unit_only: bool = True, sort: str = "recent", limit: int = 20) -> dict:
+    """최근 공실(폐업 후 신규 음식점 인허가가 없는 자리) 목록 + 좌표 + 지속일수."""
+    s = store()
+    g, d, label = _resolve_area(gu, dong)
+    u = s.units
+    m = u["vacant"] & u["vacant_days"].between(int(min_days), int(max_days)) & _area_mask(u, g, d)
+    if single_unit_only:
+        m &= u["is_single_unit"]
+    service, cats, cat_label = _resolve_category(previous_category)
+    if service or cats:
+        m &= _cat_mask(u, service, cats, cat_col="last_category", service_col="last_service")
+    v = u[m].sort_values("vacant_days", ascending=(sort != "longest"))
+
+    by_dong = v.groupby(["gu", "dong"]).size().sort_values(ascending=False).head(10)
+    rows = [{
+        "address": r["addr"], "unit_id": r["uid"], "gu": r["gu"], "dong": r["dong"],
+        "lat": r["lat"], "lon": r["lon"], "vacant_days": int(r["vacant_days"]), "vacant_since": r["last_close"],
+        "last_store": r["last_name"], "last_category": r["last_category"], "last_store_years": r["last_life_years"],
+        "closures_since_2010": int(r["closures_since_2010"]), "avg_years_since_2010": r["avg_life_since_2010_years"],
+        "category_path": r["category_path"],
+    } for _, r in v.head(limit).iterrows()]
+    return _py({
+        "area": label, "previous_category": cat_label, "total_vacant": int(len(v)),
+        "vacant_days_median": None if v.empty else int(v["vacant_days"].median()),
+        "top_dongs": [{"gu": k[0], "dong": k[1], "count": int(c)} for k, c in by_dong.items()],
+        "units": rows, "shown": len(rows),
+        "basis": _basis(definition=f"폐업 후 {min_days}~{max_days}일 동안 같은 자리에 일반·휴게음식점 신규 인허가가 없는 자리"
+                                   + (" (동시영업 1개 이하 단일 점포 자리만)" if single_unit_only else ""),
+                        caveat="음식점 외 업종(소매·사무실 등)으로 전환됐을 수 있으므로 현장 확인 필요. 10년 이상 공백은 철거·주소변경 가능성이 커 기본 제외."),
+    })
+
+
+# ─────────────────────────── Tool 6. find_risk_spots ───────────────────────────
+def find_risk_spots(gu: str | None = None, dong: str | None = None, min_closures: int = 3,
+                    since_year: int = C.SURVIVAL_START_YEAR, category: str | None = None, limit: int = 20) -> dict:
+    """반복 폐업 지점 — 단일 점포 자리 중 교체가 잦고 존속기간이 짧은 곳."""
+    s = store()
+    g, d, label = _resolve_area(gu, dong)
+    st = s.stores
+    c = st[st["closed"] & (st["ld"].dt.year >= int(since_year)) & _area_mask(st, g, d)]
+    agg = c.groupby("uid").agg(closures=("name", "size"), avg_days=("dur_days", "mean"),
+                               names=("name", lambda x: " → ".join(x.tolist()[-5:])))
+    u = s.units.loc[agg.index]
+    agg = agg[u["is_single_unit"].to_numpy()]
+    if category:
+        service, cats, _ = _resolve_category(category)
+        ok = st[_cat_mask(st, service, cats)]["uid"].unique()
+        agg = agg[agg.index.isin(ok)]
+    risky = agg[agg["closures"] >= int(min_closures)].sort_values(["closures", "avg_days"], ascending=[False, True])
+
+    area_units = s.units[_area_mask(s.units, g, d) & s.units["is_single_unit"]
+                         & (s.units["last_open"].dt.year >= int(since_year))]
+    rows = []
+    for uid, r in risky.head(limit).iterrows():
+        un = s.units.loc[uid]
+        rows.append({
+            "address": un["addr"], "unit_id": uid, "gu": un["gu"], "dong": un["dong"], "lat": un["lat"], "lon": un["lon"],
+            "closures": int(r["closures"]), "avg_years_per_store": _years(r["avg_days"]),
+            "recent_store_names": r["names"], "category_path": un["category_path"],
+            "now": "공실" if un["vacant"] else f"영업중: {un['current_stores']}",
+        })
+    return _py({
+        "area": label, "spots_found": int(len(risky)),
+        "share_of_single_units_pct": round(len(risky) / max(len(area_units), 1) * 100, 1),
+        "spots": rows,
+        "basis": _basis(definition=f"{since_year}년 이후 개업해 폐업한 점포가 {min_closures}회 이상인 자리. 동시영업 1개 이하(단일 점포)만 포함해 백화점·푸드코트 등 다점포 건물 제외.",
+                        caveat="교체가 잦다는 사실만 보여줄 뿐 원인(임대료·입지·운영)은 데이터로 알 수 없음."),
+    })
+
+
+# ─────────────────────────── Tool 7. compare_areas ───────────────────────────
+def compare_areas(areas: list[str], category: str | None = None, since_year: int = C.SURVIVAL_START_YEAR) -> dict:
+    """구·동 간 생존율·공실률·사이클·경쟁점포 수 교차 비교."""
+    s = store()
+    if not areas:
+        areas = ["중구", "동구", "서구", "남구", "북구", "수성구", "달서구", "달성군", "군위군"]
+    service, cats, cat_label = _resolve_category(category)
+    base = s.stores[s.stores["ld"].dt.year >= int(since_year)]
+    results, errors = [], []
+    for a in areas:
+        try:
+            parts = a.replace(A.SIDO, "").split()
+            gu_txt = parts[0] if parts and A.normalize_gu(parts[0]) else None
+            dong_txt = parts[-1] if parts and (len(parts) > 1 or not gu_txt) else None
+            g, d, label = _resolve_area(gu_txt, dong_txt)
+        except ToolError as e:
+            errors.append(str(e))
+            continue
+        f = base[_area_mask(base, g, d) & _cat_mask(base, service, cats)]
+        sv = _survival(f, curve=False) if len(f) >= C.MIN_GROUP_N else {"n": int(len(f)), "note": "표본 부족"}
+
+        vac = s.vacancy[(s.vacancy["level"] == ("동" if d else "구군")) & (s.vacancy["gu"] == g)]
+        if d:
+            vac = vac[vac["dong"].isin(d)]
+        cyc, _ = _cycle_for(g, d)
+        units_3y, vacant = int(vac["units_3y"].sum()), int(vac["vacant"].sum())
+
+        active = s.stores[_area_mask(s.stores, g, d) & ~s.stores["closed"]]
+        comp = int(_cat_mask(active, service, cats).sum())
+        u = s.units[_area_mask(s.units, g, d)]
+        results.append({
+            "area": label,
+            "survival": {k: sv.get(k) for k in ("n", "median_survival_years", "survival_1y_pct", "survival_3y_pct", "survival_5y_pct", "note") if k in sv},
+            "vacancy_rate_pct": round(vacant / units_3y * 100, 1) if units_3y else None,
+            "vacant_units": vacant, "units_active_within_3y": units_3y,
+            "cycle_stage": cyc["stage"], "open_close_ratio_recent_3y": cyc["open_close_ratio_recent"],
+            "active_stores_all": int(len(active)), "active_stores_same_category": comp,
+            "repeat_closure_spots": int((u["is_single_unit"] & (u["closures_since_2010"] >= 3)).sum()),
+            "top_active_categories": active["category"].value_counts().head(3).to_dict(),
+        })
+
+    def rank(key, reverse):
+        ok = [r for r in results if (r["survival"].get(key) if key.startswith(("median", "survival_")) else r.get(key)) is not None]
+        get = (lambda r: r["survival"][key]) if key.startswith(("median", "survival_")) else (lambda r: r[key])
+        return [r["area"] for r in sorted(ok, key=get, reverse=reverse)]
+
+    return _py({
+        "category": cat_label, "areas": results, "errors": errors or None,
+        "ranking": {
+            "longest_median_survival": rank("median_survival_years", True),
+            "highest_3y_survival": rank("survival_3y_pct", True),
+            "lowest_vacancy_rate": rank("vacancy_rate_pct", False),
+        },
+        "basis": _basis(survival_cohort=f"{since_year}년 이후 인허가, Kaplan-Meier",
+                        vacancy_definition="최근 3년 내 영업했던 자리 중 폐업 후 90일~3년간 신규 인허가 없는 자리 비율",
+                        cycle="최근 3년 vs 직전 3년 개업/폐업 비율"),
+    })
+
+
+# ─────────────────────────── Tool 8. transition_matrix ───────────────────────────
+def transition_matrix(from_category: str | None = None, to_category: str | None = None,
+                      gu: str | None = None, dong: str | None = None, top_n: int = 10) -> dict:
+    """같은 자리에서 A 업태 폐업 후 어떤 업태가 들어왔고, 그 후속 점포는 얼마나 버텼는가."""
+    s = store()
+    g, d, label = _resolve_area(gu, dong)
+    t = s.transitions[_area_mask(s.transitions, g, d)]
+    t = t.assign(dur_days=t["to_dur_days"], closed=t["to_closed"].fillna(False).astype(bool))
+
+    def successor_stats(frame):
+        sm = summarize(frame["dur_days"], frame["closed"], curve_years=0)
+        return {"median_survival_years": sm["median_survival_years"], "survival_1y_pct": sm["survival_1y_pct"],
+                "survival_3y_pct": sm["survival_3y_pct"], "median_gap_days": int(frame["gap_days"].median())}
+
+    basis = _basis(area=label, definition="단일 점포 자리에서 폐업한 점포 → 다음 인허가 점포 쌍. 후속 점포 생존은 Kaplan-Meier(영업중 중도절단).")
+    if from_category or to_category:
+        fs, fc, flabel = _resolve_category(from_category)
+        ts, tc, tlabel = _resolve_category(to_category)
+        m = _cat_mask(t, fs, fc, "from_category", "from_service") & _cat_mask(t, ts, tc, "to_category", "to_service")
+        sub = t[m]
+        if sub.empty:
+            raise ToolError(f"{label}에서 '{flabel} → {tlabel}' 전이 사례가 없습니다.")
+        col = "to_category" if from_category and not to_category else "from_category" if to_category and not from_category else None
+        out = {"area": label, "from": flabel, "to": tlabel, "transitions": int(len(sub)),
+               "overall_successor": successor_stats(sub)}
+        if col:
+            total = len(sub)
+            rows = []
+            for k, f in sub.groupby(col):
+                if len(f) < 5:
+                    continue
+                rows.append({col: k, "count": int(len(f)), "share_pct": round(len(f) / total * 100, 1), **successor_stats(f)})
+            rows.sort(key=lambda r: -r["count"])
+            out["breakdown"] = rows[:top_n]
+            if from_category and fc:
+                out["same_category_reentry_pct"] = round(float(sub["to_category"].isin(fc).mean() * 100), 1)
+        else:
+            out["examples"] = sub.sort_values("to_open", ascending=False).head(5)[
+                ["uid", "from_name", "from_life_years", "to_name", "to_open", "gap_days"]].to_dict("records")
+        return _py(out | {"basis": basis})
+
+    pairs = (t.groupby(["from_category", "to_category"]).size().sort_values(ascending=False)
+             .head(top_n).reset_index(name="count"))
+    svc = t.groupby(["from_service", "to_service"]).size().reset_index(name="count")
+    return _py({"area": label, "transitions": int(len(t)), "top_pairs": pairs.to_dict("records"),
+                "service_switch": svc.to_dict("records"), "basis": basis})
+
+
+TOOL_FUNCTIONS = {
+    "get_market_cycle": get_market_cycle,
+    "find_vacant_units": find_vacant_units,
+    "get_survival_curve": get_survival_curve,
+    "get_unit_history": get_unit_history,
+    "find_risk_spots": find_risk_spots,
+    "compare_areas": compare_areas,
+    "transition_matrix": transition_matrix,
+    "normalize_address": normalize_address,
+}
