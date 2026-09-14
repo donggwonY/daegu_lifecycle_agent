@@ -9,6 +9,7 @@
 ```bash
 pip install -r requirements.txt
 python -m pipeline.build          # 야간 배치(약 15초) → data/processed
+python -m unittest tests.test_core_units   # 주소 정규화·사이클 판정 단위 테스트 (데이터 불필요)
 python -m tests.smoke_test        # Tool 8종 점검 (API 키 불필요)
 streamlit run app.py              # 웹 UI
 ```
@@ -46,7 +47,7 @@ agent.py                  Claude 도구 호출 루프 (claude-opus-5, 스트리�
 mcp_server.py             같은 Tool 8종을 MCP 로 노출
 app.py, ui_visuals.py     Streamlit UI (상담 · 대시보드 · 자리 이력)
 run_batch.ps1             작업 스케줄러용 야간 배치 스크립트
-tests/                    smoke_test(Tool), agent_loop_test(가짜 클라이언트로 루프), mcp_check(MCP stdio)
+tests/                    test_core_units(주소·사이클 단위), smoke_test(Tool), agent_loop_test(가짜 클라이언트로 루프), mcp_check(MCP stdio)
 ```
 
 ## 기획서 → 구현 대응
