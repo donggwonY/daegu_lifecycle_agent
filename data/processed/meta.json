@@ -1,0 +1,158 @@
+{
+  "reference_date": "2026-09-08",
+  "built_at": "2026-09-14 15:21:32",
+  "quality": {
+    "raw_rows": 128091,
+    "duplicates_removed": 0,
+    "missing_license_date": 0,
+    "closed_without_close_date": 0,
+    "date_contradiction": 0,
+    "non_daegu_address": 5,
+    "non_daegu_examples": [
+      "경상북도 김천시 덕곡동 999-4 ",
+      "경상남도 사천시 사남면 유천리 162-3 ",
+      "경기도 수원시 권선구 금곡동 1077 수원모아미래도센트럴타운2단지 상가동 B223호",
+      "경상북도 경산시 옥곡동 817-3 ",
+      "경상북도 경주시 외동읍 신계리 1039 "
+    ],
+    "address_unparsed": 9,
+    "coord_fill_pct": {
+      "일반음식점": 95.9,
+      "휴게음식점": 97.5
+    }
+  },
+  "records": {
+    "일반음식점": {
+      "total": 97114,
+      "closed": 67713,
+      "active": 29401,
+      "unique_units": 48413,
+      "date_min": "1963-10-10",
+      "date_max": "2026-09-08"
+    },
+    "휴게음식점": {
+      "total": 30972,
+      "closed": 21871,
+      "active": 9101,
+      "unique_units": 17966,
+      "date_min": "1965-10-09",
+      "date_max": "2026-09-08"
+    },
+    "통합": {
+      "total": 128086,
+      "closed": 89584,
+      "active": 38502,
+      "unique_units": 55628
+    }
+  },
+  "records_by_gu": {
+    "달서구": 24981,
+    "북구": 20769,
+    "수성구": 20140,
+    "동구": 17194,
+    "중구": 14549,
+    "서구": 10296,
+    "달성군": 9533,
+    "남구": 9487,
+    "군위군": 1137
+  },
+  "vacancy_buckets_all_vacant_units": {
+    "10년 이상": 14178,
+    "3~10년": 7643,
+    "1~3년": 3185,
+    "3개월~1년": 1609,
+    "3개월 미만": 448
+  },
+  "recent_vacancy_units": 4794,
+  "single_unit_ratio_pct": 73.4,
+  "max_closures_all_units_top5": [
+    {
+      "addr": "대구광역시 중구 달구벌대로 2077 지하1층",
+      "n_closed": 925,
+      "max_concurrent": 55
+    },
+    {
+      "addr": "대구광역시 동구 동부로 149 지하1층",
+      "n_closed": 692,
+      "max_concurrent": 65
+    },
+    {
+      "addr": "대구광역시 중구 큰장로26길 55",
+      "n_closed": 253,
+      "max_concurrent": 67
+    },
+    {
+      "addr": "대구광역시 수성구 들안로 38",
+      "n_closed": 229,
+      "max_concurrent": 48
+    },
+    {
+      "addr": "대구광역시 달서구 월배로 232 지하1층",
+      "n_closed": 183,
+      "max_concurrent": 28
+    }
+  ],
+  "max_closures_single_units_top5": [
+    {
+      "addr": "대구광역시 달서구 달구벌대로 1734 1층",
+      "n_closed": 11,
+      "category_path": "커피숍 → 커피숍 → 커피숍 → 커피숍 → 기타 휴게음식점 → 다방 → 기타 휴게음식점 → 커피숍"
+    },
+    {
+      "addr": "대구광역시 수성구 동대구로8길 53 1층",
+      "n_closed": 9,
+      "category_path": "한식 → 일반조리판매 → 기타 휴게음식점 → 일반조리판매 → 기타 → 분식 → 일식 → 커피숍"
+    },
+    {
+      "addr": "대구광역시 남구 중앙대로31길 9-2 1층",
+      "n_closed": 8,
+      "category_path": "한식 → 한식 → 호프/통닭 → 기타 → 기타 → 중국식 → 중국식 → 기타"
+    },
+    {
+      "addr": "대구광역시 달서구 월배로24길 110 1층",
+      "n_closed": 8,
+      "category_path": "호프/통닭 → 한식 → 한식 → 식육(숯불구이) → 식육(숯불구이) → 경양식 → 한식 → 한식"
+    },
+    {
+      "addr": "대구광역시 동구 신서로 16-1 1층",
+      "n_closed": 8,
+      "category_path": "기타 휴게음식점 → 기타 휴게음식점 → 기타 → 기타 → 기타 → 기타 → 기타 휴게음식점 → 기타"
+    }
+  ],
+  "service_switch_units": 1893,
+  "survival_by_decade_1y": [
+    {
+      "decade": "1980년대",
+      "n": 2484,
+      "survival_1y_pct": 100.0
+    },
+    {
+      "decade": "1990년대",
+      "n": 12770,
+      "survival_1y_pct": 99.9
+    },
+    {
+      "decade": "2000년대",
+      "n": 44410,
+      "survival_1y_pct": 91.9
+    },
+    {
+      "decade": "2010년대",
+      "n": 38080,
+      "survival_1y_pct": 88.8
+    },
+    {
+      "decade": "2020년대",
+      "n": 29710,
+      "survival_1y_pct": 80.5
+    }
+  ],
+  "params": {
+    "SURVIVAL_START_YEAR": 2010,
+    "VACANCY_MIN_DAYS": 90,
+    "VACANCY_MAX_DAYS": 1095,
+    "HANDOVER_TOLERANCE_DAYS": 60,
+    "CYCLE_WINDOW_YEARS": 3,
+    "CYCLE_MIN_EVENTS": 20
+  }
+}

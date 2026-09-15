@@ -48,4 +48,12 @@ CATEGORY_ALIASES = {
     "한식": ["한식"],
 }
 
+# ── LLM ──
+LLM_PROVIDER = "gemini"        # "gemini"(무료 등급) | "claude"
 CLAUDE_MODEL = "claude-opus-5"
+# 앞에서부터 시도하고, 모델이 없거나(404) 무료 한도 초과(429)면 다음 모델로 넘어간다 (모델별 한도가 따로 잡힘)
+GEMINI_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite"]
+
+# ── 공개 웹 서비스 보호 (운영자 키를 쓸 때만 적용) ──
+MAX_QUESTIONS_PER_SESSION = 20     # 브라우저 세션당 질문 수
+GLOBAL_QUESTIONS_PER_MINUTE = 3    # 전체 방문자 합산. 질문 1개 ≈ 모델 호출 2~4회이므로 무료 분당 한도보다 낮게
