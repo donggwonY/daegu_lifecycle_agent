@@ -1,7 +1,11 @@
 __pycache__/
 *.pyc
 .venv/
-.env
 logs/
+
+# 원본 CSV(38MB)는 배포에 필요 없음 — 배치 산출물 data/processed 만 커밋
 data/raw/
-data/processed/
+
+# 비밀값
+.streamlit/secrets.toml
+.env

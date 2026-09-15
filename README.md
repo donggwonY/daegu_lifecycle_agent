@@ -7,18 +7,39 @@
 ## 빠른 시작
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # 웹만 돌릴 땐 requirements.txt
 python -m pipeline.build          # 야간 배치(약 15초) → data/processed
 python -m unittest tests.test_core_units   # 주소 정규화·사이클 판정 단위 테스트 (데이터 불필요)
 python -m tests.smoke_test        # Tool 8종 점검 (API 키 불필요)
 streamlit run app.py              # 웹 UI
 ```
 
-- **AI 상담** 탭은 `ANTHROPIC_API_KEY` 가 필요하다(환경변수 또는 사이드바 입력). **대시보드 / 자리 이력 조회** 탭은 키 없이 동작한다.
-- 터미널 대화: `python agent.py`
+- **AI 상담** 탭은 LLM API 키가 필요하다. 기본은 **Google Gemini 무료 등급**(`LLM_PROVIDER="gemini"`), 설정 하나로 Claude 로 전환.
+  키는 `.streamlit/secrets.toml`(예: `secrets.toml.example`) 또는 환경변수 `GEMINI_API_KEY` 에 두거나, 비워 두면 방문자가 사이드바에 자기 키를 입력한다.
+  **대시보드 / 자리 이력 조회** 탭은 키 없이 동작한다.
+- 터미널 대화: `python agent.py gemini` 또는 `python agent.py claude`
+
+## 웹 배포 (Streamlit Community Cloud, 무료)
+
+1. 배치 산출물(`data/processed`, 약 19MB)을 포함해 GitHub 에 푸시한다. 원본 CSV(`data/raw`)는 올리지 않는다.
+2. https://share.streamlit.io 에서 GitHub 로 로그인 → **Create app** → 저장소 `donggwonY/daegu_lifecycle_agent`, 브랜치 `main`, 파일 `app.py`.
+   **Advanced settings** 에서 Python 3.12 선택, **Secrets** 에 `secrets.toml.example` 내용을 채워 붙여넣는다.
+3. Deploy → `https://<이름>.streamlit.app` 주소로 공개된다. 이후 `main` 에 푸시하면 자동 재배포.
+
+데이터 갱신: 로컬에서 새 CSV 로 `python -m pipeline.build` → `data/processed` 커밋·푸시.
+
+**운영자 키 보호 장치** — 운영자 키를 Secrets 에 넣으면 세션당 질문 수(`MAX_QUESTIONS_PER_SESSION`)와
+전체 방문자 합산 분당 질문 수(`GLOBAL_QUESTIONS_PER_MINUTE`)를 제한한다. 무료 한도(429)에 걸리면 `config.GEMINI_MODELS`
+순서대로 다음 모델을 시도한다(모델별 한도가 따로 잡힘). 방문자 키는 그 브라우저 세션에만 보관하고 서버 환경변수에 쓰지 않는다.
 - MCP 서버(Claude Desktop·Claude Code 연결): `python mcp_server.py`
 
-Claude Desktop `claude_desktop_config.json` 예:
+### API 키 없이 대화형 시연 — Claude Desktop + MCP
+
+Claude Desktop 앱이 claude.ai 계정으로 대화를 처리하고, 이 프로젝트의 Tool 8종을 MCP 로 호출한다(API 결제 불필요).
+설정 후 앱을 **완전히 종료했다가 재실행** → 채팅 입력창 `+` 메뉴에서 `daegu-lifecycle` 연결 확인 →
+프롬프트 **"대구 창업 상권 상담 시작"**(`startup_consult`)을 선택하면 숫자 원칙이 적용된 상태로 상담을 시작한다.
+
+`%APPDATA%\Claude\claude_desktop_config.json` 에 `mcpServers` 추가 (기존 설정은 유지):
 
 ```json
 {
@@ -43,11 +64,12 @@ core/survival.py          Kaplan-Meier (영업 중 = 중도절단)
 core/cycle.py             사이클 단계 판정 규칙
 core/tools.py             Tool 8종 (근거 수치·정의·기준일을 반환값에 포함)
 core/tool_specs.py        Claude API Tool 스키마
-agent.py                  Claude 도구 호출 루프 (claude-opus-5, 스트리밍, adaptive thinking)
+agent.py                  공통(시스템 프롬프트·Tool 실행) + Claude 도구 호출 루프 + create_agent(provider)
+agent_gemini.py           Gemini 도구 호출 루프 (무료 등급, 모델 자동 대체)
 mcp_server.py             같은 Tool 8종을 MCP 로 노출
 app.py, ui_visuals.py     Streamlit UI (상담 · 대시보드 · 자리 이력)
 run_batch.ps1             작업 스케줄러용 야간 배치 스크립트
-tests/                    test_core_units(주소·사이클 단위), smoke_test(Tool), agent_loop_test(가짜 클라이언트로 루프), mcp_check(MCP stdio)
+tests/                    test_core_units(주소·사이클 단위), smoke_test(Tool), agent_loop_test·gemini_loop_test(가짜 클라이언트로 루프), mcp_check(MCP stdio)
 ```
 
 ## 기획서 → 구현 대응

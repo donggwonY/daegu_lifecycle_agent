@@ -16,6 +16,10 @@ async def main():
         await session.initialize()
         tools = (await session.list_tools()).tools
         print(len(tools), "tools:", [t.name for t in tools])
+        prompts = (await session.list_prompts()).prompts
+        print(len(prompts), "prompts:", [p.name for p in prompts])
+        pr = await session.get_prompt("startup_consult", {"question": "수성구 카페 어때?"})
+        print("prompt chars:", len(pr.messages[0].content.text))
         res = await session.call_tool("get_survival_curve", {"category": "카페", "gu": "중구"})
         print(res.content[0].text[:300])
 

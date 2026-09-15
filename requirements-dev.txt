@@ -1,0 +1,4 @@
+# 로컬 전용: 야간 배치(좌표 변환) + MCP 서버
+-r requirements.txt
+pyproj>=3.6
+mcp>=1.2

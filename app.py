@@ -1,14 +1,24 @@
-"""Streamlit UI.  실행: streamlit run app.py"""
+"""Streamlit UI.  실행: streamlit run app.py
+
+LLM 설정은 .streamlit/secrets.toml(배포 시 Streamlit Cloud Secrets) 또는 환경변수에서 읽는다.
+  LLM_PROVIDER = "gemini" | "claude"
+  GEMINI_API_KEY / ANTHROPIC_API_KEY = 운영자 키 (없으면 방문자가 자기 키를 입력)
+"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import threading
+import time
 import uuid
+from collections import deque
 
-import anthropic
 import pandas as pd
 import streamlit as st
 
+import config as C
+from agent import API_KEY_ENV, create_agent
 from core import tools as T
 from ui_visuals import cycle_chart, history_chart, render_tool_result, survival_chart, _map
 
@@ -31,8 +41,60 @@ EXAMPLES = [
 ]
 
 
-def has_credentials() -> bool:
-    return bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+def setting(name: str, default=None):
+    """Streamlit Secrets → 환경변수 → 기본값 순."""
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:  # secrets.toml 이 없는 로컬 실행
+        pass
+    return os.environ.get(name, default)
+
+
+PROVIDER = str(setting("LLM_PROVIDER", C.LLM_PROVIDER)).lower()
+PROVIDER_LABEL = {"gemini": "Google Gemini", "claude": "Anthropic Claude"}.get(PROVIDER, PROVIDER)
+KEY_NAME = API_KEY_ENV.get(PROVIDER, "API_KEY")
+OPERATOR_KEY = setting(KEY_NAME)
+MAX_PER_SESSION = int(setting("MAX_QUESTIONS_PER_SESSION", C.MAX_QUESTIONS_PER_SESSION))
+GLOBAL_PER_MINUTE = int(setting("GLOBAL_QUESTIONS_PER_MINUTE", C.GLOBAL_QUESTIONS_PER_MINUTE))
+KEY_HELP = {
+    "gemini": "https://aistudio.google.com/apikey 에서 무료로 발급",
+    "claude": "https://console.anthropic.com 에서 발급(유료 크레딧 필요)",
+}.get(PROVIDER, "")
+
+
+@st.cache_resource
+def _rate_window() -> dict:
+    """모든 방문자가 공유하는 최근 1분 질문 시각 (서버 프로세스당 1개)."""
+    return {"lock": threading.Lock(), "times": deque()}
+
+
+def take_quota() -> str | None:
+    """질문 1회를 허용하면 None, 막아야 하면 안내 문구. 방문자 본인 키는 제한하지 않는다."""
+    if not OPERATOR_KEY:
+        return None
+    used = st.session_state.get("questions_used", 0)
+    if used >= MAX_PER_SESSION:
+        return f"이 세션의 무료 질문 {MAX_PER_SESSION}회를 모두 사용했습니다. 대시보드·자리 이력 조회 탭은 계속 이용할 수 있습니다."
+    w, now = _rate_window(), time.time()
+    with w["lock"]:
+        while w["times"] and now - w["times"][0] > 60:
+            w["times"].popleft()
+        if len(w["times"]) >= GLOBAL_PER_MINUTE:
+            wait = int(60 - (now - w["times"][0])) + 1
+            return f"지금 이용자가 많아 잠시 대기가 필요합니다. 약 {wait}초 뒤에 다시 질문해 주세요."
+        w["times"].append(now)
+    st.session_state.questions_used = used + 1
+    return None
+
+
+def get_agent(api_key: str):
+    """방문자 세션마다 별도 에이전트. 키가 바뀌면 새로 만든다."""
+    sig = hashlib.sha256(f"{PROVIDER}:{api_key}".encode()).hexdigest()
+    if st.session_state.get("agent_sig") != sig:
+        st.session_state.agent = create_agent(PROVIDER, api_key)
+        st.session_state.agent_sig = sig
+    return st.session_state.agent
 
 
 # ─────────────────────────── 사이드바 ───────────────────────────
@@ -46,19 +108,21 @@ with st.sidebar:
     c2.metric("영업 중", f"{rec['active']:,}")
     st.caption(f"기준일 {META['reference_date']} · 배치 {META['built_at']}")
     st.divider()
-    if has_credentials():
-        st.success("Claude API 연결 준비됨", icon="✅")
+    if OPERATOR_KEY:
+        left = MAX_PER_SESSION - st.session_state.get("questions_used", 0)
+        st.success(f"AI 상담 사용 가능 ({PROVIDER_LABEL})", icon="✅")
+        st.caption(f"이 세션 남은 질문 {max(left, 0)}회")
     else:
-        key = st.text_input("ANTHROPIC_API_KEY", type="password", help="AI 상담 탭에만 필요합니다. 대시보드·자리 조회는 키 없이 동작합니다.")
-        if key:
-            os.environ["ANTHROPIC_API_KEY"] = key
-            st.rerun()
+        # 방문자 키는 이 브라우저 세션(session_state)에만 보관 — 서버 환경변수에 넣지 않는다
+        st.text_input(f"내 {PROVIDER_LABEL} API 키", type="password", key="user_api_key",
+                      help=f"AI 상담 탭에만 필요합니다. {KEY_HELP}. 키는 이 브라우저 세션에만 보관됩니다.")
     st.subheader("예시 질문")
     for q in EXAMPLES:
         if st.button(q, width="stretch"):
             st.session_state.pending = q
     if st.button("🔄 대화 초기화", width="stretch"):
         st.session_state.pop("agent", None)
+        st.session_state.pop("agent_sig", None)
         st.session_state.history = []
         st.rerun()
 
@@ -79,54 +143,58 @@ def render_tools(tool_events: list[dict], msg_id: str):
 
 
 with tab_chat:
+    st.caption(f"질문은 {PROVIDER_LABEL} API로 전달되어 답변이 생성됩니다"
+               + (" (무료 등급 입력은 제공사의 서비스 개선에 쓰일 수 있음)" if PROVIDER == "gemini" else "")
+               + ". 수치는 인허가 데이터 분석 도구의 반환값만 사용하며, 창업 판단의 참고 자료입니다.")
     st.session_state.setdefault("history", [])
     for m in st.session_state.history:
         with st.chat_message(m["role"]):
             if m["role"] == "assistant":
                 render_tools(m.get("tools", []), m["id"])
             st.markdown(m["content"])
+            if m.get("model"):
+                st.caption(f"모델: {m['model']}")
 
     prompt = st.chat_input("예) 수성구 범어동에서 치킨집 하면 어때?") or st.session_state.pop("pending", None)
     if prompt:
-        st.session_state.history.append({"role": "user", "content": prompt})
+        api_key = OPERATOR_KEY or st.session_state.get("user_api_key")
         with st.chat_message("user"):
             st.markdown(prompt)
         with st.chat_message("assistant"):
-            if not has_credentials():
-                st.error("사이드바에 ANTHROPIC_API_KEY 를 입력하세요. (대시보드·자리 조회 탭은 키 없이 사용 가능)")
+            if not api_key:
+                st.error(f"사이드바에 {PROVIDER_LABEL} API 키를 입력하세요 ({KEY_HELP}). 대시보드·자리 이력 조회 탭은 키 없이 이용할 수 있습니다.")
                 st.stop()
-            if "agent" not in st.session_state:
-                from agent import LifecycleAgent
-                st.session_state.agent = LifecycleAgent()
+            blocked = take_quota()
+            if blocked:
+                st.warning(blocked)
+                st.stop()
+            st.session_state.history.append({"role": "user", "content": prompt})
+            agent = get_agent(api_key)
             msg_id = uuid.uuid4().hex[:8]
             tool_box = st.container()
             text_box = st.empty()
-            text, tool_events = "", []
-            try:
-                with st.spinner("데이터 확인 중…"):
-                    for ev in st.session_state.agent.ask(prompt):
-                        if ev["type"] == "text":
-                            text += ev["text"]
-                            text_box.markdown(text + "▌")
-                        elif ev["type"] == "tool_call":
-                            tool_box.caption(f"🔧 `{ev['name']}` 호출")
-                        elif ev["type"] == "tool_result":
-                            tool_events.append(ev)
-                        elif ev["type"] == "error":
-                            text += f"\n\n⚠️ {ev['message']}"
-            except anthropic.AuthenticationError:
-                text += "\n\n⚠️ API 인증 실패 — 키를 확인하세요."
-            except anthropic.RateLimitError:
-                text += "\n\n⚠️ 요청 한도 초과 — 잠시 후 다시 시도하세요."
-            except anthropic.APIConnectionError:
-                text += "\n\n⚠️ 네트워크 연결 실패."
-            except anthropic.APIStatusError as e:
-                text += f"\n\n⚠️ API 오류 {e.status_code}: {e.message}"
+            text, tool_events, model = "", [], None
+            with st.spinner("데이터 확인 중…"):
+                for ev in agent.ask(prompt):
+                    if ev["type"] == "text":
+                        text += ev["text"]
+                        text_box.markdown(text + "▌")
+                    elif ev["type"] == "tool_call":
+                        tool_box.caption(f"🔧 `{ev['name']}` 호출")
+                    elif ev["type"] == "tool_result":
+                        tool_events.append(ev)
+                    elif ev["type"] == "done":
+                        model = ev.get("model")
+                    elif ev["type"] == "error":
+                        text += f"\n\n⚠️ {ev['message']}"
             text_box.empty()
             with tool_box:
                 render_tools(tool_events, msg_id)
             st.markdown(text)
-        st.session_state.history.append({"role": "assistant", "content": text, "tools": tool_events, "id": msg_id})
+            if model:
+                st.caption(f"모델: {model}")
+        st.session_state.history.append({"role": "assistant", "content": text, "tools": tool_events,
+                                         "id": msg_id, "model": model})
 
 
 # ─────────────────────────── 2. 대시보드 ───────────────────────────

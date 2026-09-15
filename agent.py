@@ -1,11 +1,12 @@
 """상권 생애주기 추론 에이전트 — Claude API 도구 호출 루프.
 
-CLI 실행:  python agent.py
+CLI 실행:  python agent.py [gemini|claude]
 """
 from __future__ import annotations
 
 import inspect
 import json
+import os
 import sys
 from typing import Iterator
 
@@ -61,9 +62,13 @@ def run_tool(name: str, args: dict) -> tuple[dict | None, str, bool]:
         return None, f"Tool 실행 중 오류: {type(e).__name__}: {e}", True
 
 
-class LifecycleAgent:
-    def __init__(self, client: anthropic.Anthropic | None = None, model: str = C.CLAUDE_MODEL):
-        self.client = client or anthropic.Anthropic()
+class ClaudeAgent:
+    provider = "claude"
+
+    def __init__(self, api_key: str | None = None, client: anthropic.Anthropic | None = None,
+                 model: str = C.CLAUDE_MODEL):
+        # api_key 를 명시적으로 넘긴다 — 공개 서버에서 os.environ 에 넣으면 모든 방문자가 공유하게 됨
+        self.client = client or (anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic())
         self.model = model
         self.system = build_system_prompt()
         self.messages: list[dict] = []
@@ -73,7 +78,24 @@ class LifecycleAgent:
 
     def ask(self, user_text: str) -> Iterator[dict]:
         """이벤트 스트림: text / tool_call / tool_result / done / error."""
+        checkpoint = len(self.messages)
         self.messages.append({"role": "user", "content": user_text})
+        try:
+            yield from self._loop()
+        except anthropic.AuthenticationError:
+            yield self._fail(checkpoint, "Claude API 인증 실패 — API 키를 확인하세요.")
+        except anthropic.RateLimitError:
+            yield self._fail(checkpoint, "Claude API 요청 한도 초과 — 잠시 후 다시 시도하세요.")
+        except anthropic.APIConnectionError:
+            yield self._fail(checkpoint, "Claude API 네트워크 연결 실패.")
+        except anthropic.APIStatusError as e:
+            yield self._fail(checkpoint, f"Claude API 오류 {e.status_code}: {e.message}")
+
+    def _fail(self, checkpoint: int, message: str) -> dict:
+        del self.messages[checkpoint:]  # 반쯤 진행된 턴은 버려 다음 질문이 깨진 이력으로 시작하지 않게
+        return {"type": "error", "message": message}
+
+    def _loop(self) -> Iterator[dict]:
         for _ in range(MAX_TOOL_ROUNDS):
             with self.client.beta.messages.stream(
                 model=self.model,
@@ -103,7 +125,7 @@ class LifecycleAgent:
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             if not tool_uses:
-                yield {"type": "done", "usage": response.usage.model_dump() if response.usage else None}
+                yield {"type": "done", "model": self.model}
                 return
 
             results = []
@@ -123,11 +145,27 @@ class LifecycleAgent:
         yield {"type": "error", "message": f"Tool 호출이 {MAX_TOOL_ROUNDS}회를 넘어 중단했습니다."}
 
 
+LifecycleAgent = ClaudeAgent  # 이전 이름 호환
+
+API_KEY_ENV = {"gemini": "GEMINI_API_KEY", "claude": "ANTHROPIC_API_KEY"}
+
+
+def create_agent(provider: str = C.LLM_PROVIDER, api_key: str | None = None):
+    provider = (provider or C.LLM_PROVIDER).lower()
+    if provider == "gemini":
+        from agent_gemini import GeminiAgent
+        return GeminiAgent(api_key=api_key)
+    if provider == "claude":
+        return ClaudeAgent(api_key=api_key)
+    raise ValueError(f"지원하지 않는 LLM_PROVIDER: {provider} (gemini | claude)")
+
+
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    agent = LifecycleAgent()
-    print("대구 상권 생애주기 에이전트 (종료: exit, 초기화: reset)\n")
+    provider = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LLM_PROVIDER", C.LLM_PROVIDER)).lower()
+    agent = create_agent(provider, os.environ.get(API_KEY_ENV.get(provider, "")))
+    print(f"대구 상권 생애주기 에이전트 [{provider}] (종료: exit, 초기화: reset)\n")
     while True:
         try:
             q = input("\n질문> ").strip()
@@ -140,25 +178,15 @@ def main() -> None:
             continue
         if not q:
             continue
-        try:
-            for ev in agent.ask(q):
-                if ev["type"] == "text":
-                    print(ev["text"], end="", flush=True)
-                elif ev["type"] == "tool_call":
-                    print(f"\n  🔧 {ev['name']}({json.dumps(ev['input'], ensure_ascii=False)})", flush=True)
-                elif ev["type"] == "tool_result" and ev["error"]:
-                    print(f"  ⚠️ {ev['error']}", flush=True)
-                elif ev["type"] == "error":
-                    print(f"\n[오류] {ev['message']}")
-        except anthropic.AuthenticationError:
-            print("\n[오류] API 인증 실패 — ANTHROPIC_API_KEY 를 설정하세요.")
-            break
-        except anthropic.RateLimitError:
-            print("\n[오류] 요청 한도 초과 — 잠시 후 다시 시도하세요.")
-        except anthropic.APIConnectionError:
-            print("\n[오류] 네트워크 연결 실패.")
-        except anthropic.APIStatusError as e:
-            print(f"\n[오류] API {e.status_code}: {e.message}")
+        for ev in agent.ask(q):
+            if ev["type"] == "text":
+                print(ev["text"], end="", flush=True)
+            elif ev["type"] == "tool_call":
+                print(f"\n  🔧 {ev['name']}({json.dumps(ev['input'], ensure_ascii=False)})", flush=True)
+            elif ev["type"] == "tool_result" and ev["error"]:
+                print(f"  ⚠️ {ev['error']}", flush=True)
+            elif ev["type"] == "error":
+                print(f"\n[오류] {ev['message']}")
         print()
 
 
