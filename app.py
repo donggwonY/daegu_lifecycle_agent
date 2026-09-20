@@ -119,7 +119,8 @@ with st.sidebar:
     st.title("🏪 상권 생애주기 에이전트")
     st.caption("그 자리의 과거를 데이터로 확인합니다")
     rec = META["records"]["통합"]
-    st.metric("인허가 레코드 (일반+휴게음식점)", f"{rec['total']:,}")
+    services = [k for k in META["records"] if k != "통합"]
+    st.metric(f"인허가 레코드 ({'+'.join(s.replace('영업', '') for s in services)})", f"{rec['total']:,}")
     c1, c2 = st.columns(2)
     c1.metric("폐업", f"{rec['closed']:,}")
     c2.metric("영업 중", f"{rec['active']:,}")
@@ -247,6 +248,34 @@ with tab_dash:
               .merge(vac_d, on="dong", how="left").merge(cyc_d, on="dong", how="left"))
         df.columns = ["동", "표본", "중앙생존(년)", "1년 생존%", "3년 생존%", "최근3년 자리", "공실률%", "사이클", "개폐업비"]
         st.dataframe(df, hide_index=True, width="stretch")
+
+    if S.area_context is not None:
+        st.subheader("동네 프로필 (상가정보 · 인구 · 집객시설)")
+        ctx = S.area_context if not gu else S.area_context[S.area_context["gu"] == gu]
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            dong_sel = st.selectbox("행정동", sorted(ctx["admin_dong"].unique()), key="dash_dong")
+            prof = T.get_area_profile(gu=ctx[ctx["admin_dong"] == dong_sel]["gu"].iat[0], dong=dong_sel)
+            st.metric("상권 유형", prof["market_type"])
+            st.caption(prof["market_type_basis"])
+            st.metric("업종 다양성 지수", f"{prof['diversity_index']}", f"대구 {prof['city_diversity_index']}", delta_color="off")
+            pop = prof["population"]
+            if pop.get("total"):
+                st.metric("주민등록 인구", f"{int(pop['total']):,}명",
+                          f"15~29세 {pop['age_15_29_pct']}% · 65세+ {pop['age_65_plus_pct']}%", delta_color="off")
+            f = prof["facilities"]
+            st.caption(f"전통시장 {f['traditional_markets']}곳 · 주차장 {f['parking_lots']}곳({f['parking_slots']:,}면)")
+        with c2:
+            render_tool_result("get_area_profile", prof, key="dash-profile")
+            st.caption("현재 영업 점포 " + f"{prof['stores_now']:,}개 중 음식 {prof['food_stores_now']:,}개 · 주요 업종 "
+                       + ", ".join(f"{k} {v}" for k, v in prof["top_categories"].items()))
+
+        types = ctx.groupby("market_type").size().sort_values(ascending=False)
+        st.caption("상권 유형 분포: " + " · ".join(f"{k} {v}곳" for k, v in types.items()))
+
+    if S.station is not None and not gu:
+        st.subheader("도시철도 역별 일평균 승하차 (유동인구 대리지표)")
+        render_tool_result("get_station_traffic", T.get_station_traffic(top_n=15), key="dash-station")
 
     st.subheader("최근 공실 후보 지도")
     st.caption(vac["basis"]["definition"] + " · " + vac["basis"]["caveat"])

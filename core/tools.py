@@ -61,6 +61,19 @@ class DataStore:
         self.area_year = rd("area_year")
         self.survival = rd("survival")
         self.vacancy = rd("vacancy_area")
+        # 보조 데이터(상가정보·인구·지하철 등). pipeline/external.py 를 돌리지 않았으면 None 이고,
+        # 해당 Tool 만 "데이터 없음"으로 안내한다 — 기존 8종은 그대로 동작한다.
+        def opt(name):
+            path = processed_dir / f"{name}.parquet"
+            return pd.read_parquet(path) if path.exists() else None
+
+        self.poi = opt("poi")
+        self.area_context = opt("area_context")
+        self.legal_admin = opt("legal_admin_map")
+        self.station = opt("station_traffic")
+        self.parking = opt("parking")
+        self.market = opt("market")
+
         self.ref = pd.Timestamp(self.meta["reference_date"])          # 분석 기준일
         self.categories = sorted(self.stores["category"].unique())     # 실제 존재하는 업태 목록(입력 검증용)
         self.dongs = self.units[["gu", "dong"]].dropna().drop_duplicates()  # 구-동 조합(동 이름 해석용)
@@ -639,6 +652,215 @@ def transition_matrix(from_category: str | None = None, to_category: str | None 
                 "service_switch": svc.to_dict("records"), "basis": basis})
 
 
+# ─────────────────────────── 보조 데이터 Tool (9~11) ───────────────────────────
+EARTH_R = 6371000.0
+
+
+def _distance_m(lat: float, lon: float, lats, lons):
+    """한 점과 여러 점 사이의 거리(m). 하버사인 공식."""
+    p1, p2 = math.radians(lat), np.radians(np.asarray(lats, dtype=float))
+    dlat, dlon = p2 - p1, np.radians(np.asarray(lons, dtype=float) - lon)
+    a = np.sin(dlat / 2) ** 2 + math.cos(p1) * np.cos(p2) * np.sin(dlon / 2) ** 2
+    return 2 * EARTH_R * np.arcsin(np.sqrt(a))
+
+
+def _require(df, name: str):
+    if df is None:
+        raise ToolError(f"{name} 데이터가 준비되지 않았습니다. `python -m pipeline.external` 을 먼저 실행하세요.")
+    return df
+
+
+def _resolve_admin_dong(gu: str | None, dong: str | None) -> pd.DataFrame:
+    """행정동 이름 또는 법정동 이름으로 area_context 행을 찾는다.
+
+    인허가 주소는 법정동(삼덕동1가), 인구 통계는 행정동(삼덕동) 기준이라 둘을 모두 받아 준다.
+    """
+    ctx = _require(store().area_context, "동네 맥락")
+    g = A.normalize_gu(gu) if gu else None
+    if not dong:
+        return ctx[ctx["gu"] == g] if g else ctx
+    text = dong.replace(A.SIDO, "").replace("대구", "").strip().split()[-1]
+    hit = ctx[ctx["admin_dong"] == text]
+    if hit.empty:  # 법정동으로 들어온 경우 → 상가정보에서 학습한 매핑으로 행정동을 찾는다
+        m = store().legal_admin
+        if m is not None:
+            names = m[m["legal_dong"].str.startswith(text.rstrip("동읍면"))]
+            if g:
+                names = names[names["gu"] == g]
+            hit = ctx[ctx["admin_dong"].isin(names["admin_dong"]) & ctx["gu"].isin(names["gu"])]
+    if hit.empty:
+        hit = ctx[ctx["admin_dong"].str.startswith(text.rstrip("동읍면"))]
+    if g:
+        hit = hit[hit["gu"] == g]
+    if hit.empty:
+        raise ToolError(f"'{dong}'에 해당하는 행정동을 찾지 못했습니다 (예: 삼덕동, 범어3동, 다사읍).")
+    if hit["gu"].nunique() > 1:
+        raise ToolError(f"'{dong}'이(가) 여러 구에 있습니다: {sorted(hit['gu'].unique())}. 구를 함께 지정하세요.")
+    return hit
+
+
+def get_area_profile(gu: str | None = None, dong: str | None = None, top_n: int = 5) -> dict:
+    """동네 프로필 — 상권 유형, 업종 구성·다양성, 인구·연령, 집객 시설, 인허가 기반 사이클·공실률."""
+    s = store()
+    hit = _resolve_admin_dong(gu, dong)
+    if len(hit) > 1 and dong:
+        rows = [{"gu": r["gu"], "admin_dong": r["admin_dong"], "poi_total": int(r["poi_total"]),
+                 "market_type": r["market_type"]} for _, r in hit.nlargest(8, "poi_total").iterrows()]
+        return _py({"matched": len(hit), "candidates": rows,
+                    "hint": "행정동이 여러 개입니다. 하나를 골라 다시 물어보세요."})
+    r = hit.nlargest(1, "poi_total").iloc[0] if len(hit) > 1 else hit.iloc[0]
+
+    profile = {
+        "area": f"{r['gu']} {r['admin_dong']}",
+        "market_type": r["market_type"], "market_type_basis": r["market_type_basis"],
+        "stores_now": int(r["poi_total"]), "food_stores_now": int(r["poi_food"]),
+        "share_pct": {"음식": r["food_share_pct"], "소매": r["retail_share_pct"], "교육": r["edu_share_pct"],
+                      "과학·기술+부동산+임대": r["office_share_pct"], "수리·개인+보건": r["personal_share_pct"],
+                      "숙박": r["lodging_share_pct"], "음식 중 주점": r["pub_share_of_food_pct"]},
+        "city_share_pct": {"음식": r["city_food"], "소매": r["city_retail"], "교육": r["city_edu"],
+                           "과학·기술+부동산+임대": r["city_office"], "수리·개인+보건": r["city_personal"],
+                           "숙박": r["city_lodging"], "음식 중 주점": r["city_pub"]},
+        "diversity_index": r["diversity_index"], "city_diversity_index": r["city_diversity"],
+        "diversity_note": "0에 가까울수록 한 업종 쏠림, 1에 가까울수록 고르게 분포",
+        "top_categories": dict(list(json.loads(r["top_categories_json"]).items())[:top_n]),
+        "population": {"total": r.get("pop_total"), "ref_month": r.get("pop_ref_month"),
+                       "age_15_29_pct": r.get("age_15_29_pct"), "age_30_49_pct": r.get("age_30_49_pct"),
+                       "age_65_plus_pct": r.get("age_65_plus_pct")},
+        "facilities": {"traditional_markets": int(r.get("market_count", 0)),
+                       "market_stores": int(r.get("market_stores", 0) or 0),
+                       "parking_lots": int(r.get("parking_count", 0)),
+                       "parking_slots": int(r.get("parking_slots", 0) or 0)},
+    }
+
+    # 인허가 데이터(시간축) 쪽 지표를 같은 동네 기준으로 붙인다
+    legal = s.legal_admin
+    legal_dongs = (legal.loc[(legal["gu"] == r["gu"]) & (legal["admin_dong"] == r["admin_dong"]), "legal_dong"]
+                   .tolist() if legal is not None else [])
+    st = s.stores[(s.stores["gu"] == r["gu"]) & s.stores["dong"].isin(legal_dongs)]
+    if len(st) >= C.MIN_GROUP_N:
+        coh = st[st["ld"].dt.year >= C.SURVIVAL_START_YEAR]
+        profile["license_based"] = {
+            "legal_dongs": legal_dongs,
+            "records": int(len(st)), "active": int((~st["closed"]).sum()),
+            "survival": _survival(coh, curve=False) if len(coh) >= C.MIN_GROUP_N else {"note": "표본 부족"},
+        }
+        vac = s.vacancy[(s.vacancy["level"] == "동") & (s.vacancy["gu"] == r["gu"])
+                        & s.vacancy["dong"].isin(legal_dongs)]
+        if len(vac):
+            units_3y, vacant = int(vac["units_3y"].sum()), int(vac["vacant"].sum())
+            profile["license_based"]["vacancy_rate_pct"] = round(vacant / units_3y * 100, 1) if units_3y else None
+            profile["license_based"]["vacant_units"] = vacant
+        cyc = s.cycle[(s.cycle["level"] == "동") & (s.cycle["gu"] == r["gu"]) & s.cycle["dong"].isin(legal_dongs)]
+        if len(cyc):
+            counts = cyc[_CYCLE_COUNTS].sum()
+            profile["license_based"]["cycle"] = classify_stage(*counts.tolist())
+
+    # 이름이 같은 지하철역이 있으면 참고로 붙인다(좌표가 없어 이름 기준 추정)
+    if s.station is not None:
+        base = r["admin_dong"].rstrip("0123456789동읍면가")
+        near = s.station[s.station["station"].str.startswith(base)] if base else s.station.iloc[0:0]
+        if len(near):
+            row = near.nlargest(1, "daily_total").iloc[0]
+            profile["nearby_station_by_name"] = {
+                "station": row["station"], "daily_total": int(row["daily_total"]),
+                "note": "역 좌표가 없어 이름이 같은 역을 참고로 연결한 값 — 실제 인접 여부는 확인 필요",
+            }
+    return _py(profile | {"basis": _basis(
+        poi="소상공인시장진흥공단 상가(상권)정보 2026-06 현재 영업 점포",
+        population=f"행정안전부 주민등록 인구 {r.get('pop_ref_month')}",
+        definition="상권 유형은 업종 구성비를 대구 평균과 비교해 판정(절대 비중 기준 동시 충족)",
+        caveat="상가정보는 현재 단면이라 과거 추이는 인허가 기반 지표(license_based)를 함께 보아야 함")})
+
+
+def find_nearby(address: str, radius_m: int = C.NEARBY_RADIUS_M, category: str | None = None,
+                limit: int = 10) -> dict:
+    """특정 자리 반경 안의 경쟁 점포·공실·주차장·전통시장 — '이 자리 주변'을 보는 Tool."""
+    s = store()
+    poi = _require(s.poi, "상가정보")
+    u, _ = _pick_unit(address)
+    if pd.isna(u["lat"]) or pd.isna(u["lon"]):
+        raise ToolError(f"'{u['addr']}'는 좌표가 없어 반경 분석을 할 수 없습니다.")
+    lat, lon, radius = float(u["lat"]), float(u["lon"]), int(radius_m)
+
+    d = _distance_m(lat, lon, poi["lat"], poi["lon"])
+    near = poi[d <= radius].assign(dist_m=d[d <= radius].round(0))
+    food = near[near["cat_l"] == "음식"]
+    same = None
+    if category:
+        service, cats, cat_label = _resolve_category(category)
+        # 상가정보는 분류 체계가 달라(인허가 '커피숍' ↔ 상가정보 '비알코올 음료점'),
+        # config 의 검색어 사전을 거쳐 중·소분류 이름으로 부분 일치 검색한다.
+        keys = {category.strip()}
+        for c in (cats or []):
+            keys |= set(C.POI_CATEGORY_KEYWORDS.get(c, [c]))
+        keys |= set(C.POI_CATEGORY_KEYWORDS.get(category.strip(), []))
+        m = pd.Series(False, index=near.index)
+        for k in keys:
+            m |= near["cat_m"].str.contains(k, na=False) | near["cat_s"].str.contains(k, na=False)
+        same = {"query": cat_label, "count": int(m.sum()),
+                "examples": near[m].nsmallest(min(limit, 5), "dist_m")[["name", "cat_s", "dist_m"]].to_dict("records")}
+
+    units = s.units.dropna(subset=["lat", "lon"])
+    du = _distance_m(lat, lon, units["lat"], units["lon"])
+    near_u = units[du <= radius].assign(dist_m=du[du <= radius].round(0))
+    vacant = near_u[near_u["recent_vacancy"]].nsmallest(limit, "dist_m")
+    risky = near_u[near_u["is_single_unit"] & (near_u["closures_since_2010"] >= 3)].nsmallest(limit, "dist_m")
+
+    out = {
+        "center": {"address": u["addr"], "unit_id": u["uid"], "lat": lat, "lon": lon,
+                   "status": "공실" if u["vacant"] else f"영업중: {u['current_stores']}"},
+        "radius_m": radius,
+        "stores_in_radius": int(len(near)), "food_stores_in_radius": int(len(food)),
+        "food_share_pct": round(len(food) / len(near) * 100, 1) if len(near) else None,
+        "top_categories": near["cat_m"].value_counts().head(5).to_dict(),
+        "same_category": same,
+        "recent_vacancies": [{"address": r["addr"], "dist_m": int(r["dist_m"]), "vacant_days": int(r["vacant_days"]),
+                              "last_store": r["last_name"], "last_category": r["last_category"],
+                              "lat": r["lat"], "lon": r["lon"]} for _, r in vacant.iterrows()],
+        "recent_vacancy_count": int(near_u["recent_vacancy"].sum()),
+        "repeat_closure_spots": [{"address": r["addr"], "dist_m": int(r["dist_m"]),
+                                  "closures_since_2010": int(r["closures_since_2010"]),
+                                  "category_path": r["category_path"], "lat": r["lat"], "lon": r["lon"]}
+                                 for _, r in risky.iterrows()],
+    }
+    if s.parking is not None:
+        dp = _distance_m(lat, lon, s.parking["lat"], s.parking["lon"])
+        pk = s.parking[dp <= radius]
+        out["parking"] = {"lots": int(len(pk)), "slots": int(pk["slots"].fillna(0).sum())}
+    if s.market is not None:
+        dm = _distance_m(lat, lon, s.market["lat"], s.market["lon"])
+        mk = s.market[dm <= max(radius, 1000)].assign(dist_m=dm[dm <= max(radius, 1000)].round(0))
+        out["traditional_markets_within_1km"] = [
+            {"name": r["name"], "dist_m": int(r["dist_m"]), "stores": None if pd.isna(r["stores"]) else int(r["stores"])}
+            for _, r in mk.nsmallest(3, "dist_m").iterrows()]
+    return _py(out | {"basis": _basis(
+        poi="소상공인시장진흥공단 상가(상권)정보 2026-06 현재 영업 점포(전 업종)",
+        definition=f"중심 좌표에서 직선거리 {radius}m 이내",
+        caveat="상가정보와 인허가는 출처가 달라 점포 수가 정확히 일치하지 않음. 직선거리라 실제 도보 거리와 다름")})
+
+
+def get_station_traffic(station: str | None = None, top_n: int = 10) -> dict:
+    """지하철 역별 승하차 인원과 시간대 구성 — 유동인구 대리지표."""
+    st = _require(store().station, "지하철 승하차")
+    basis = _basis(source="대구교통공사 역별 일별 시간별 승하차인원", period=st["period"].iat[0],
+                   definition="일평균 승차·하차 인원. 시간대 비중은 하차(= 그 동네로 들어오는 사람) 기준",
+                   caveat="역 좌표가 없어 특정 자리와의 거리는 계산하지 않음. 역세권 여부는 별도 확인 필요")
+    cols = ["station", "daily_boarding", "daily_alighting", "daily_total",
+            "morning_07_09_pct", "lunch_11_14_pct", "evening_17_20_pct", "night_22_24_pct", "peak_hour"]
+    if not station:
+        return _py({"stations": int(len(st)), "ranking_by_daily_total": st.head(top_n)[cols].to_dict("records"),
+                    "basis": basis})
+    key = station.replace("역", "").strip()
+    hit = st[st["station"].str.contains(key, na=False)]
+    if hit.empty:
+        raise ToolError(f"'{station}' 역을 찾지 못했습니다. 예: 반월당, 동대구역, 범어")
+    r = hit.nlargest(1, "daily_total").iloc[0]
+    rank = int((st["daily_total"] > r["daily_total"]).sum()) + 1
+    return _py({**{c: r[c] for c in cols}, "rank_by_daily_total": rank, "of_stations": int(len(st)),
+                "city_median_daily_total": int(st["daily_total"].median()),
+                "other_matches": hit["station"].tolist()[1:], "basis": basis})
+
+
 TOOL_FUNCTIONS = {
     "get_market_cycle": get_market_cycle,
     "find_vacant_units": find_vacant_units,
@@ -648,4 +870,7 @@ TOOL_FUNCTIONS = {
     "compare_areas": compare_areas,
     "transition_matrix": transition_matrix,
     "normalize_address": normalize_address,
+    "get_area_profile": get_area_profile,
+    "find_nearby": find_nearby,
+    "get_station_traffic": get_station_traffic,
 }

@@ -23,6 +23,13 @@ CASES = [
     ("transition_matrix", {"from_category": "한식", "gu": "중구"}),
     ("transition_matrix", {"to_category": "카페"}),
     ("get_survival_curve", {"gu": "없는구"}),                           # 오류 경로
+    # 보조 데이터 Tool
+    ("get_area_profile", {"gu": "중구", "dong": "삼덕동"}),              # "이 동네 어떤 곳이야?"
+    ("get_area_profile", {"dong": "대신동"}),
+    ("find_nearby", {"address": "대구 중구 동성로5길 83", "radius_m": 300, "category": "카페"}),
+    ("get_station_traffic", {"station": "반월당"}),
+    ("get_station_traffic", {}),
+    ("find_nearby", {"address": "없는주소 999"}),                       # 오류 경로
 ]
 
 

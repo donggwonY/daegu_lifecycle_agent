@@ -77,6 +77,21 @@ def normalize_address(query: str, limit: int = 10) -> dict:
     return T.normalize_address(query, limit)
 
 
+@mcp.tool(description=_DESC["get_area_profile"])
+def get_area_profile(gu: str | None = None, dong: str | None = None, top_n: int = 5) -> dict:
+    return T.get_area_profile(gu, dong, top_n)
+
+
+@mcp.tool(description=_DESC["find_nearby"])
+def find_nearby(address: str, radius_m: int = 300, category: str | None = None, limit: int = 10) -> dict:
+    return T.find_nearby(address, radius_m, category, limit)
+
+
+@mcp.tool(description=_DESC["get_station_traffic"])
+def get_station_traffic(station: str | None = None, top_n: int = 10) -> dict:
+    return T.get_station_traffic(station, top_n)
+
+
 @mcp.prompt(name="startup_consult", title="대구 창업 상권 상담 시작",
             description="에이전트 시스템 프롬프트(숫자 원칙·해석 원칙)를 적용하고 첫 질문으로 상담을 시작")
 def startup_consult(question: str = "대구에서 카페 창업을 준비 중이에요. 어디서부터 확인하면 좋을까요?") -> str:
