@@ -2,6 +2,20 @@
 
 모든 Tool 은 야간 배치 산출물(data/processed)을 조회만 하며,
 반환값에 근거 수치(표본 수, 기간, 정의)를 반드시 포함한다 — 환각 방지 (기획서 8장).
+
+같은 함수를 세 곳이 부른다: AI 에이전트(agent.py), 웹 대시보드(app.py), MCP 서버(mcp_server.py).
+그래서 어디서 보든 같은 숫자가 나온다.
+
+파일 구조
+    DataStore / store()   parquet 7개를 프로세스당 한 번 읽어 두는 보관소
+    _py, _basis, ...      공통 헬퍼 (약 150줄). Tool 을 읽기 전에 이것부터 보면 빠르다
+    Tool 1~8              같은 틀의 반복: 입력 해석 → 필터링 → 계산 → 근거와 함께 dict 반환
+
+Tool 이 지키는 공통 규칙
+    - 입력이 애매하면 추측하지 않고 ToolError 를 던져 AI 가 사용자에게 되묻게 한다
+    - 표본 수(n)를 반드시 함께 돌려준다
+    - 추정할 수 없는 값은 0 이 아니라 None 으로 둔다
+    - 목록은 limit 으로 잘라 AI 에게 보내는 양을 제한한다
 """
 from __future__ import annotations
 
@@ -20,11 +34,21 @@ from core.survival import YEAR, summarize
 
 
 class ToolError(ValueError):
-    """사용자 입력으로 결과를 만들 수 없을 때 — 에이전트에게 is_error 로 전달된다."""
+    """사용자 입력으로 결과를 만들 수 없을 때 — 에이전트에게 is_error 로 전달된다.
+
+    '입력이 잘못됨'(없는 구 이름)과 '코드 버그'(KeyError 등)를 구분하려고 따로 만든 예외다.
+    ToolError 메시지는 AI 에게 그대로 전달돼 사용자에게 되묻는 데 쓰이고,
+    그 밖의 예외는 "Tool 실행 중 오류"로 따로 알린다(agent.run_tool).
+    """
 
 
 # ─────────────────────────── 데이터 로딩 ───────────────────────────
 class DataStore:
+    """배치 산출물 7개 + meta.json 을 메모리에 올려 두는 보관소.
+
+    12만 행이라 통째로 올려도 부담이 없고, 모든 Tool 이 이 표들을 걸러 쓰기만 한다.
+    """
+
     def __init__(self, processed_dir=C.PROCESSED_DIR):
         if not (processed_dir / "meta.json").exists():
             raise FileNotFoundError(f"{processed_dir} 에 배치 산출물이 없습니다. `python -m pipeline.build` 를 먼저 실행하세요.")
@@ -37,19 +61,30 @@ class DataStore:
         self.area_year = rd("area_year")
         self.survival = rd("survival")
         self.vacancy = rd("vacancy_area")
-        self.ref = pd.Timestamp(self.meta["reference_date"])
-        self.categories = sorted(self.stores["category"].unique())
-        self.dongs = self.units[["gu", "dong"]].dropna().drop_duplicates()
+        self.ref = pd.Timestamp(self.meta["reference_date"])          # 분석 기준일
+        self.categories = sorted(self.stores["category"].unique())     # 실제 존재하는 업태 목록(입력 검증용)
+        self.dongs = self.units[["gu", "dong"]].dropna().drop_duplicates()  # 구-동 조합(동 이름 해석용)
 
 
 @lru_cache(maxsize=1)
 def store() -> DataStore:
+    """DataStore 를 프로세스당 한 번만 만든다.
+
+    @lru_cache 는 '같은 인자로 부르면 계산하지 않고 저장해 둔 결과를 준다'는 뜻이다.
+    덕분에 웹 방문자가 아무리 많아도 parquet 읽기는 서버 시작 후 한 번뿐이다.
+    표를 읽기만 하고 고치지 않으므로 여러 방문자가 공유해도 안전하다.
+    """
     return DataStore()
 
 
 # ─────────────────────────── 공통 헬퍼 ───────────────────────────
 def _py(v):
-    """numpy / pandas 값을 JSON 직렬화 가능한 파이썬 값으로."""
+    """numpy / pandas 값을 JSON 직렬화 가능한 파이썬 값으로.
+
+    pandas 가 돌려주는 값은 numpy 자료형(np.int64 등)이라 json.dumps 가 거부한다.
+    결측값도 종류별로 달라서(NaN, NaT, pd.NA) 전부 None 으로 통일한다.
+    dict·list 안까지 재귀로 훑는다.
+    """
     if isinstance(v, dict):
         return {k: _py(x) for k, x in v.items()}
     if isinstance(v, (list, tuple)):
@@ -66,11 +101,22 @@ def _py(v):
 
 
 def _basis(**extra) -> dict:
+    """모든 Tool 결과에 붙는 '근거' 블록 — 환각 방지 장치.
+
+    출처·기준일·정의·한계를 숫자와 함께 돌려주면, AI 가 "2010년 이후 개업 기준"처럼
+    조건을 밝히며 답할 수 있고 없는 숫자를 지어낼 여지가 줄어든다.
+    """
     s = store()
     return {"data": "행정안전부 지방행정 인허가(대구 일반·휴게음식점)", "reference_date": s.meta["reference_date"], **extra}
 
 
 def _resolve_area(gu: str | None = None, dong: str | None = None) -> tuple[str | None, list[str] | None, str]:
+    """사람이 말한 지역명 → (구, 동 목록, 표시용 이름).
+
+    AI 가 넘기는 인자는 사용자가 말한 그대로일 때가 많다("수성", "범어", "삼덕동").
+    맞는 이름을 찾지 못하거나 여러 구에 같은 동이 있으면 ToolError 로 되묻는다 — 조용히 아무 데나 고르면
+    AI 가 엉뚱한 지역 숫자를 사실처럼 말하게 된다.
+    """
     s = store()
     g = A.normalize_gu(gu) if gu else None
     if gu and not g and gu.strip().endswith(("구", "군")):
@@ -114,7 +160,11 @@ def _area_mask(df: pd.DataFrame, g, d) -> pd.Series:
 
 
 def _resolve_category(text: str | None) -> tuple[str | None, list[str] | None, str]:
-    """반환: (service, categories, label). 업종명(일반/휴게음식점)과 업태·별칭 모두 허용."""
+    """반환: (service, categories, label). 업종명(일반/휴게음식점)과 업태·별칭 모두 허용.
+
+    "카페"처럼 데이터에 없는 일상어는 config.CATEGORY_ALIASES 로 실제 업태 여러 개(커피숍·까페·다방…)에 매핑한다.
+    label 은 "카페(커피숍, 까페, 다방)"처럼 무엇을 합쳤는지 사용자에게 밝히기 위한 문자열이다.
+    """
     if not text:
         return None, None, "전체 업태"
     t = text.strip()
@@ -168,7 +218,12 @@ def _unit_brief(u: pd.Series) -> dict:
 
 # ─────────────────────────── Tool 1. normalize_address ───────────────────────────
 def normalize_address(query: str, limit: int = 10) -> dict:
-    """주소·상호 문자열을 '자리(unit)' 후보로 정규화."""
+    """주소·상호 문자열을 '자리(unit)' 후보로 정규화.
+
+    아래 네 방법을 정확한 것부터 차례로 시도하고, 처음 걸리는 결과를 쓴다.
+        1 지번 기본주소 일치   2 도로명 기본주소 일치   3 주소 토큰 포함 검색   4 상호명 검색
+    어떤 방법으로 찾았는지(method)도 함께 돌려주어, AI 와 사용자가 신뢰도를 판단할 수 있게 한다.
+    """
     s = store()
     u = s.units
     q = (query or "").strip()
@@ -186,11 +241,12 @@ def normalize_address(query: str, limit: int = 10) -> dict:
             uids = s.stores.loc[s.stores["road_key"] == rd["key"], "uid"].unique()
             hits, method = pd.Index(uids), "도로명 기본주소 일치"
     if hits.empty:
+        # 정규식이 실패한 주소(건물명만 있는 등)는 단어를 모두 포함하는 자리를 찾는다
         tokens = [t for t in q.replace(",", " ").split() if t not in ("대구", "대구시", A.SIDO)]
         hay = u["addr"] + " " + u["jibun_addr"]
         m = pd.Series(True, index=u.index)
         for t in tokens:
-            m &= hay.str.contains(t, regex=False)
+            m &= hay.str.contains(t, regex=False)  # regex=False: 괄호 같은 기호를 글자 그대로 취급
         hits, method = u.index[m], "주소 토큰 포함 검색"
     if hits.empty and len(q) >= 2:
         uids = s.stores.loc[s.stores["name"].str.contains(q, regex=False), "uid"].unique()
@@ -200,10 +256,10 @@ def normalize_address(query: str, limit: int = 10) -> dict:
                     "hint": "도로명(예: 동성로5길 83) 또는 지번(예: 삼덕동1가 28-6) 형식으로 다시 시도하세요."})
 
     cand = u.loc[hits]
-    if floor:
+    if floor:  # 질문에 "2층"이 있으면 같은 층을 우선하되, 없으면 후보를 버리지 않는다
         same = cand[cand["floor"] == floor]
         cand = same if not same.empty else cand
-    cand = cand.sort_values("n_records", ascending=False)
+    cand = cand.sort_values("n_records", ascending=False)  # 이력이 많은 자리를 위로
     return _py({
         "query": query, "method": method, "matched": int(len(cand)),
         "matches": [_unit_brief(r) for _, r in cand.head(limit).iterrows()],
@@ -212,6 +268,7 @@ def normalize_address(query: str, limit: int = 10) -> dict:
 
 
 def _pick_unit(address: str) -> tuple[pd.Series, dict]:
+    """가장 그럴듯한 자리 하나 + 나머지 후보 목록. 후보는 결과에 함께 실어 사용자가 고를 수 있게 한다."""
     res = normalize_address(address, limit=5)
     if not res["matched"]:
         raise ToolError(f"'{address}'에 해당하는 자리를 찾지 못했습니다. {res.get('hint', '')}")
@@ -274,13 +331,20 @@ def get_unit_history(address: str, whole_building: bool = False, max_records: in
 def get_survival_curve(category: str | None = None, gu: str | None = None, dong: str | None = None,
                        since_year: int = C.SURVIVAL_START_YEAR, group_by: str | None = None,
                        min_n: int = 100, top_n: int = 20) -> dict:
-    """Kaplan-Meier 생존곡선. group_by='category'|'gu'|'dong'|'service' 이면 그룹별 순위표."""
+    """Kaplan-Meier 생존곡선. group_by='category'|'gu'|'dong'|'service' 이면 그룹별 순위표.
+
+    "카페 열려는데 어때?" → 업태 하나의 곡선,
+    "뭐가 더 오래 가?"   → group_by="category" 로 업태 순위표.
+    한 함수가 두 질문을 모두 받는 이유는, AI 가 부를 수 있는 Tool 수를 늘리지 않기 위해서다.
+    """
     s = store()
+    # 사람 말("카페", "수성") → 데이터의 정확한 값으로. 실패하면 여기서 ToolError 가 난다.
     service, cats, cat_label = _resolve_category(category)
     g, d, area_label = _resolve_area(gu, dong)
     since_year = int(since_year or C.SURVIVAL_START_YEAR)
     st = s.stores
-    base = st[st["ld"].dt.year >= since_year]
+    base = st[st["ld"].dt.year >= since_year]        # 코호트: 이 연도 이후 개업분만
+    # 불리언 마스크를 & 로 결합해 조건을 한 번에 적용한다(pandas 의 기본 필터링 방식)
     frame = base[_area_mask(base, g, d) & _cat_mask(base, service, cats)]
     caveat = ("2010년 이전 개업분은 전산화 이전 단명 업소 누락으로 생존율이 과대추정됨(1990년대 1년 생존율 99.9%)."
               if since_year < C.SURVIVAL_START_YEAR else None)
@@ -294,7 +358,7 @@ def get_survival_curve(category: str | None = None, gu: str | None = None, dong:
             raise ToolError("group_by 는 category, gu, dong, service 중 하나입니다.")
         rows = []
         for key, f in frame.groupby(col):
-            if len(f) < min_n:
+            if len(f) < min_n:  # 표본이 적은 그룹이 순위표 1위에 오르는 일을 막는다
                 continue
             sm = _survival(f, curve=False)
             rows.append({col: key, **({"gu": f["gu"].iat[0]} if col == "dong" else {}), **sm})
@@ -387,7 +451,11 @@ def get_market_cycle(gu: str | None = None, dong: str | None = None, years: int 
 def find_vacant_units(gu: str | None = None, dong: str | None = None, previous_category: str | None = None,
                       min_days: int = C.VACANCY_MIN_DAYS, max_days: int = C.VACANCY_MAX_DAYS,
                       single_unit_only: bool = True, sort: str = "recent", limit: int = 20) -> dict:
-    """최근 공실(폐업 후 신규 음식점 인허가가 없는 자리) 목록 + 좌표 + 지속일수."""
+    """최근 공실(폐업 후 신규 음식점 인허가가 없는 자리) 목록 + 좌표 + 지속일수.
+
+    '공실'은 어디까지나 인허가 공백이다. 소매점·사무실로 바뀌었을 수도 있어서
+    basis.caveat 에 "현장 확인 필요"를 함께 실어 AI 가 단정하지 않게 한다.
+    """
     s = store()
     g, d, label = _resolve_area(gu, dong)
     u = s.units
@@ -421,7 +489,11 @@ def find_vacant_units(gu: str | None = None, dong: str | None = None, previous_c
 # ─────────────────────────── Tool 6. find_risk_spots ───────────────────────────
 def find_risk_spots(gu: str | None = None, dong: str | None = None, min_closures: int = 3,
                     since_year: int = C.SURVIVAL_START_YEAR, category: str | None = None, limit: int = 20) -> dict:
-    """반복 폐업 지점 — 단일 점포 자리 중 교체가 잦고 존속기간이 짧은 곳."""
+    """반복 폐업 지점 — 단일 점포 자리 중 교체가 잦고 존속기간이 짧은 곳.
+
+    is_single_unit 으로 거르지 않으면 백화점 지하 1층처럼 매장이 많은 건물이 1위를 차지한다
+    (기획서 문제 2). 데이터는 '교체가 잦다'만 말할 수 있고 이유는 알 수 없다는 점을 basis 에 밝힌다.
+    """
     s = store()
     g, d, label = _resolve_area(gu, dong)
     st = s.stores
@@ -518,7 +590,11 @@ def compare_areas(areas: list[str], category: str | None = None, since_year: int
 # ─────────────────────────── Tool 8. transition_matrix ───────────────────────────
 def transition_matrix(from_category: str | None = None, to_category: str | None = None,
                       gu: str | None = None, dong: str | None = None, top_n: int = 10) -> dict:
-    """같은 자리에서 A 업태 폐업 후 어떤 업태가 들어왔고, 그 후속 점포는 얼마나 버텼는가."""
+    """같은 자리에서 A 업태 폐업 후 어떤 업태가 들어왔고, 그 후속 점포는 얼마나 버텼는가.
+
+    from_category 만 주면 "한식 자리에 뭐가 들어왔나", to_category 만 주면 "카페는 원래 뭐였던 자리인가".
+    단순 건수뿐 아니라 후속 점포의 생존율까지 계산해서, "많이 들어온다"와 "들어와서 잘 된다"를 구분한다.
+    """
     s = store()
     g, d, label = _resolve_area(gu, dong)
     t = s.transitions[_area_mask(s.transitions, g, d)]

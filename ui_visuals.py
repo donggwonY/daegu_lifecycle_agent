@@ -1,4 +1,9 @@
-"""Tool 결과 → Streamlit 시각화."""
+"""Tool 결과 → Streamlit 시각화.
+
+핵심은 맨 아래 render_tool_result 다. Tool 이름을 보고 그 결과 JSON 에 맞는 그림을 고른다.
+대시보드 탭과 AI 상담 탭이 같은 함수를 쓰기 때문에, AI 가 Tool 을 부르면
+대시보드에서 보던 것과 똑같은 차트가 대화 안에 나타난다.
+"""
 from __future__ import annotations
 
 import pandas as pd
@@ -18,12 +23,12 @@ HOVER_LABELS = {
 
 def _map(rows: list[dict], color: str, hover: list[str], key: str):
     """pydeck 산점도 지도. color 컬럼 값이 클수록 진한 빨강."""
-    df = pd.DataFrame(rows).dropna(subset=["lat", "lon"])
+    df = pd.DataFrame(rows).dropna(subset=["lat", "lon"])  # 좌표 없는 행(약 4%)은 지도에 못 찍는다
     if df.empty:
         st.caption("좌표가 있는 결과가 없습니다.")
         return
     v = pd.to_numeric(df[color], errors="coerce") if color in df else pd.Series(0, index=df.index)
-    t = ((v - v.min()) / (v.max() - v.min() or 1)).fillna(0)
+    t = ((v - v.min()) / (v.max() - v.min() or 1)).fillna(0)  # 0~1로 정규화 (or 1 은 0으로 나누기 방지)
     df["_r"], df["_g"], df["_b"] = 255, (170 - t * 150).astype(int), (60 - t * 50).astype(int)
     layer = pdk.Layer("ScatterplotLayer", data=df, get_position="[lon, lat]", get_fill_color="[_r, _g, _b, 200]",
                       get_radius=35, radius_min_pixels=4, radius_max_pixels=14, pickable=True)
@@ -86,6 +91,7 @@ def history_chart(out: dict, key: str):
 
 
 def render_tool_result(name: str, out: dict | None, key: str):
+    """Tool 이름에 맞는 시각화를 고른다. key 는 Streamlit 이 차트를 구분하는 고유 id (중복되면 오류)."""
     if not out:
         return
     if name == "get_survival_curve":
