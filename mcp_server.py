@@ -1,6 +1,10 @@
 """MCP 서버 — Tool 8종을 Claude Desktop / Claude Code 등 MCP 클라이언트에 노출.
 
-실행(stdio):  python mcp_server.py
+실행(stdio):  python mcp_server.py   (보통은 Claude 데스크톱이 설정 파일을 보고 알아서 실행한다)
+
+MCP(Model Context Protocol) = AI 앱과 외부 도구를 잇는 표준 규격.
+이 파일에는 에이전트 루프가 없다. 루프는 Claude 데스크톱 앱이 돌리고, 여기서는 요청받은 함수만 실행한다.
+@mcp.tool 데코레이터가 함수의 타입 힌트와 기본값을 읽어 AI 에게 보여 줄 입력 스키마를 자동으로 만든다.
 """
 from __future__ import annotations
 

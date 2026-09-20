@@ -3,6 +3,15 @@
 LLM 설정은 .streamlit/secrets.toml(배포 시 Streamlit Cloud Secrets) 또는 환경변수에서 읽는다.
   LLM_PROVIDER = "gemini" | "claude"
   GEMINI_API_KEY / ANTHROPIC_API_KEY = 운영자 키 (없으면 방문자가 자기 키를 입력)
+
+Streamlit 을 읽기 전에 알아야 할 것
+    버튼을 누르거나 글자를 입력할 때마다 이 파일이 위에서 아래로 '통째로 다시 실행'된다.
+    그래서 사라지면 안 되는 값은 st.session_state 에 넣어 둔다.
+
+값을 어디에 두느냐 = 누구와 공유되느냐 (공개 웹에서 가장 중요한 판단)
+    st.session_state    방문자 한 명(브라우저 세션)   대화 이력, 에이전트, 방문자가 입력한 API 키
+    @st.cache_resource  서버 전체, 모든 방문자 공유    분당 질문 제한 창, 데이터 표(읽기 전용)
+    os.environ          서버 프로세스 전체            읽기만 한다. 방문자 키를 쓰면 다른 방문자에게 샌다
 """
 from __future__ import annotations
 
@@ -42,11 +51,15 @@ EXAMPLES = [
 
 
 def setting(name: str, default=None):
-    """Streamlit Secrets → 환경변수 → 기본값 순."""
+    """Streamlit Secrets → 환경변수 → 기본값 순.
+
+    같은 코드를 세 환경에서 돌리기 위한 장치다.
+    배포(Streamlit Cloud)는 Secrets, 내 PC 터미널은 환경변수, 아무것도 없으면 config.py 기본값.
+    """
     try:
         if name in st.secrets:
             return st.secrets[name]
-    except Exception:  # secrets.toml 이 없는 로컬 실행
+    except Exception:  # secrets.toml 이 없으면 st.secrets 접근 자체가 예외를 던진다
         pass
     return os.environ.get(name, default)
 
@@ -65,7 +78,11 @@ KEY_HELP = {
 
 @st.cache_resource
 def _rate_window() -> dict:
-    """모든 방문자가 공유하는 최근 1분 질문 시각 (서버 프로세스당 1개)."""
+    """모든 방문자가 공유하는 최근 1분 질문 시각 (서버 프로세스당 1개).
+
+    @st.cache_resource 는 '서버에 하나만 만들어 모두가 함께 쓰는 객체'를 만든다.
+    여러 방문자가 동시에 고치므로 Lock 으로 감싸야 숫자가 꼬이지 않는다.
+    """
     return {"lock": threading.Lock(), "times": deque()}
 
 
@@ -77,9 +94,9 @@ def take_quota() -> str | None:
     if used >= MAX_PER_SESSION:
         return f"이 세션의 무료 질문 {MAX_PER_SESSION}회를 모두 사용했습니다. 대시보드·자리 이력 조회 탭은 계속 이용할 수 있습니다."
     w, now = _rate_window(), time.time()
-    with w["lock"]:
+    with w["lock"]:  # 여러 방문자가 동시에 질문해도 한 번에 한 명씩만 이 블록에 들어온다
         while w["times"] and now - w["times"][0] > 60:
-            w["times"].popleft()
+            w["times"].popleft()  # 1분이 지난 기록은 버린다(deque 는 앞에서 빼기가 빠르다)
         if len(w["times"]) >= GLOBAL_PER_MINUTE:
             wait = int(60 - (now - w["times"][0])) + 1
             return f"지금 이용자가 많아 잠시 대기가 필요합니다. 약 {wait}초 뒤에 다시 질문해 주세요."
