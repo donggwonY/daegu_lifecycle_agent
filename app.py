@@ -148,6 +148,18 @@ tab_chat, tab_dash, tab_unit = st.tabs(["💬 AI 상담", "📊 대구 상권 �
 
 
 # ─────────────────────────── 1. AI 상담 ───────────────────────────
+def safe_markdown(text: str) -> str:
+    """물결표를 escape 한다.
+
+    "15~29세가 28.1%, 30~49세"처럼 범위 표기가 두 번 나오면 마크다운이 ~...~ 를 취소선으로 해석해
+    물결표가 사라지고 "1529세가 28.1%, 3049세"로 보인다. 코드 블록 밖의 ~ 만 escape 한다.
+    """
+    parts = text.split("```")
+    for i in range(0, len(parts), 2):  # 짝수 인덱스 = 코드 블록 바깥
+        parts[i] = parts[i].replace("~", "\\~")
+    return "```".join(parts)
+
+
 def render_tools(tool_events: list[dict], msg_id: str):
     for i, ev in enumerate(tool_events):
         args = json.dumps(ev["input"], ensure_ascii=False)
@@ -169,7 +181,7 @@ with tab_chat:
         with st.chat_message(m["role"]):
             if m["role"] == "assistant":
                 render_tools(m.get("tools", []), m["id"])
-            st.markdown(m["content"])
+            st.markdown(safe_markdown(m["content"]))
             if m.get("model"):
                 st.caption(f"모델: {m['model']}")
 
@@ -196,7 +208,7 @@ with tab_chat:
                 for ev in agent.ask(prompt):
                     if ev["type"] == "text":
                         text += ev["text"]
-                        text_box.markdown(text + "▌")
+                        text_box.markdown(safe_markdown(text) + "▌")
                     elif ev["type"] == "tool_call":
                         tool_box.caption(f"🔧 `{ev['name']}` 호출")
                     elif ev["type"] == "tool_result":
@@ -208,7 +220,7 @@ with tab_chat:
             text_box.empty()
             with tool_box:
                 render_tools(tool_events, msg_id)
-            st.markdown(text)
+            st.markdown(safe_markdown(text))
             if model:
                 st.caption(f"모델: {model}")
         st.session_state.history.append({"role": "assistant", "content": text, "tools": tool_events,
@@ -278,18 +290,18 @@ with tab_dash:
         render_tool_result("get_station_traffic", T.get_station_traffic(top_n=15), key="dash-station")
 
     st.subheader("최근 공실 후보 지도")
-    st.caption(vac["basis"]["definition"] + " · " + vac["basis"]["caveat"])
+    st.caption(safe_markdown(vac["basis"]["definition"] + " · " + vac["basis"]["caveat"]))
     _map(vac["units"], "vacant_days", ["last_store", "last_category", "vacant_days", "closures_since_2010"], key="dash-map")
 
     with st.expander("📐 데이터 품질 · 방법론 (기획서 5장 검증 결과 재현)"):
         q = META["quality"]
-        st.markdown(f"""
+        st.markdown(safe_markdown(f"""
 - **레코드**: 원본 {q['raw_rows']:,}건 · 중복 제거 {q['duplicates_removed']}건 · 인허가일 결측 {q['missing_license_date']}건 · 날짜 모순 {q['date_contradiction']}건 · 대구 외 주소 {q['non_daegu_address']}건 제외
 - **좌표 채움률**: {', '.join(f'{k} {v}%' for k, v in q['coord_fill_pct'].items())} (EPSG:5174 → WGS84 변환)
 - **문제1 공실 과대판정**: 공실 상태 자리의 공백기간 분포 {META['vacancy_buckets_all_vacant_units']} → 90일~3년만 유효 매물 **{META['recent_vacancy_units']:,}곳**
 - **문제2 다점포 건물**: 동시영업 수로 판별, 단일 점포 자리 비율 **{META['single_unit_ratio_pct']}%** · 전체 최다 폐업 {META['max_closures_all_units_top5'][0]['n_closed']}건({META['max_closures_all_units_top5'][0]['addr']}) → 단일 점포 기준 최다 {META['max_closures_single_units_top5'][0]['n_closed']}건
-- **문제4 업종 확장**: 일반→휴게(또는 반대) 전환으로 현재 영업 중인 자리 **{META['service_switch_units']:,}곳** (한 업종만 봤다면 공실로 오판)
-""")
+- **문제4 업종 확장**: 업종 간 전환(예: 일반음식점 → 휴게음식점)으로 현재 영업 중인 자리 **{META['service_switch_units']:,}곳** (한 업종만 봤다면 공실로 오판)
+"""))
         st.markdown("**문제3 생존편향** — 개업 연대별 1년 생존율 (그래서 생존분석은 2010년 이후 개업만)")
         st.dataframe(pd.DataFrame(META["survival_by_decade_1y"]), hide_index=True)
 
