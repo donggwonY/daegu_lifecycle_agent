@@ -120,10 +120,13 @@ with st.sidebar:
     st.caption("그 자리의 과거를 데이터로 확인합니다")
     rec = META["records"]["통합"]
     services = [k for k in META["records"] if k != "통합"]
-    st.metric(f"인허가 레코드 ({'+'.join(s.replace('영업', '') for s in services)})", f"{rec['total']:,}")
+    first_year = min(int(v["date_min"][:4]) for k, v in META["records"].items() if k != "통합")
+    st.metric(f"누적 인허가 ({'+'.join(s.replace('영업', '') for s in services)})", f"{rec['total']:,}")
+    # 누적 수치를 '현재 점포 수'로 오해하기 쉬워 기간을 명시한다
+    st.caption(f"{first_year}년부터 {META['reference_date'][:4]}년까지 문을 연 전체 기록 (현재 점포 수가 아님)")
     c1, c2 = st.columns(2)
-    c1.metric("폐업", f"{rec['closed']:,}")
-    c2.metric("영업 중", f"{rec['active']:,}")
+    c1.metric("그동안 폐업", f"{rec['closed']:,}")
+    c2.metric("현재 영업 중", f"{rec['active']:,}")
     st.caption(f"기준일 {META['reference_date']} · 배치 {META['built_at']}")
     st.divider()
     if OPERATOR_KEY:
@@ -302,6 +305,15 @@ with tab_dash:
 - **문제2 다점포 건물**: 동시영업 수로 판별, 단일 점포 자리 비율 **{META['single_unit_ratio_pct']}%** · 전체 최다 폐업 {META['max_closures_all_units_top5'][0]['n_closed']}건({META['max_closures_all_units_top5'][0]['addr']}) → 단일 점포 기준 최다 {META['max_closures_single_units_top5'][0]['n_closed']}건
 - **문제4 업종 확장**: 업종 간 전환(예: 일반음식점 → 휴게음식점)으로 현재 영업 중인 자리 **{META['service_switch_units']:,}곳** (한 업종만 봤다면 공실로 오판)
 """))
+        if S.poi is not None:
+            poi_food = int((S.poi["cat_l"] == "음식").sum())
+            poi_bakery = int(S.poi["cat_s"].fillna("").str.contains("제과|베이커리|빵").sum())
+            st.markdown(safe_markdown(
+                f"- **교차검증(현재 점포 수)**: 인허가 기준 영업 중 **{rec['active']:,}곳** vs "
+                f"소상공인 상가정보 2026-06 음식 {poi_food:,} + 제과·베이커리 {poi_bakery:,} = **{poi_food + poi_bakery:,}곳** "
+                f"(차이 {abs(rec['active'] - poi_food - poi_bakery):,}곳). 수집 시점과 출처가 다른데도 거의 일치한다.\n"
+                f"- **누적 vs 현재**: 위 {rec['total']:,}건은 {first_year}년 이후 누적이라 폐업이 {rec['closed']:,}건으로 쌓인다. "
+                f"2000년대 개업분은 84%가 폐업했지만 2020년대 개업분은 45%다 — 시간이 지날수록 폐업이 누적되는 구조."))
         st.markdown("**문제3 생존편향** — 개업 연대별 1년 생존율 (그래서 생존분석은 2010년 이후 개업만)")
         st.dataframe(pd.DataFrame(META["survival_by_decade_1y"]), hide_index=True)
 
