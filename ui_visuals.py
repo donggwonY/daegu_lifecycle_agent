@@ -90,6 +90,39 @@ def history_chart(out: dict, key: str):
     st.plotly_chart(fig, width="stretch", key=key)
 
 
+def profile_chart(out: dict, key: str):
+    """동네 업종 구성 vs 대구 평균 — 무엇이 이 동네를 특징짓는지 한눈에."""
+    share, city = out.get("share_pct"), out.get("city_share_pct")
+    if not share:
+        return
+    df = pd.DataFrame({"항목": list(share), "이 동네": list(share.values()),
+                       "대구 평균": [city.get(k) for k in share]})
+    fig = go.Figure()
+    fig.add_bar(x=df["항목"], y=df["이 동네"], name="이 동네")
+    fig.add_bar(x=df["항목"], y=df["대구 평균"], name="대구 평균", marker_opacity=0.55)
+    fig.update_layout(barmode="group", height=300, margin=dict(l=0, r=0, t=10, b=0),
+                      yaxis_title="비중(%)", legend=dict(orientation="h"))
+    st.plotly_chart(fig, width="stretch", key=key)
+
+
+def station_chart(out: dict, key: str):
+    """역별 이용객 순위 또는 한 역의 시간대 구성."""
+    slots = {"morning_07_09_pct": "아침 7~9시", "lunch_11_14_pct": "점심 11~14시",
+             "evening_17_20_pct": "저녁 17~20시", "night_22_24_pct": "심야 22~24시"}
+    if out.get("ranking_by_daily_total"):
+        df = pd.DataFrame(out["ranking_by_daily_total"])
+        fig = px.bar(df, x="station", y="daily_total", labels={"station": "", "daily_total": "일평균 승하차(명)"},
+                     height=300)
+    elif out.get("station"):
+        df = pd.DataFrame({"시간대": list(slots.values()), "비중": [out.get(k) for k in slots]})
+        fig = px.bar(df, x="시간대", y="비중", labels={"비중": "하차 비중(%)"}, height=300,
+                     title=f"{out['station']} · 일평균 {int(out['daily_total']):,}명 · 최대 {out['peak_hour']}")
+    else:
+        return
+    fig.update_layout(margin=dict(l=0, r=0, t=40, b=0))
+    st.plotly_chart(fig, width="stretch", key=key)
+
+
 def render_tool_result(name: str, out: dict | None, key: str):
     """Tool 이름에 맞는 시각화를 고른다. key 는 Streamlit 이 차트를 구분하는 고유 id (중복되면 오류)."""
     if not out:
@@ -110,6 +143,16 @@ def render_tool_result(name: str, out: dict | None, key: str):
                  "공실률%": a["vacancy_rate_pct"], "사이클": a["cycle_stage"], "동종 영업점포": a["active_stores_same_category"],
                  "반복폐업 자리": a["repeat_closure_spots"]} for a in out["areas"]]
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", key=key)
+    elif name == "get_area_profile":
+        profile_chart(out, key)
+    elif name == "get_station_traffic":
+        station_chart(out, key)
+    elif name == "find_nearby":
+        rows = [{**v, "address": v["address"]} for v in out.get("recent_vacancies", [])]
+        if rows:
+            _map(rows + [{"address": out["center"]["address"], "lat": out["center"]["lat"],
+                          "lon": out["center"]["lon"], "vacant_days": 0}], "vacant_days",
+                 ["last_store", "last_category", "vacant_days"], key)
     elif name == "transition_matrix" and out.get("breakdown"):
         df = pd.DataFrame(out["breakdown"])
         col = "to_category" if "to_category" in df else "from_category"

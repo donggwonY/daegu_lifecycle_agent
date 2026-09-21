@@ -49,7 +49,8 @@ def test_tool_loop_and_model_fallback():
     assert len(fr) == 2 and fr[0].function_response.id == "c1" and "result" in fr[0].function_response.response
     assert "error" in fr[1].function_response.response
     cfg = fake.calls[0]["config"]
-    assert len(cfg.tools[0].function_declarations) == 8 and cfg.automatic_function_calling.disable
+    from core.tool_specs import TOOL_SPECS
+    assert len(cfg.tools[0].function_declarations) == len(TOOL_SPECS) and cfg.automatic_function_calling.disable
     assert "Tool 이 반환한 값만" in cfg.system_instruction
 
 

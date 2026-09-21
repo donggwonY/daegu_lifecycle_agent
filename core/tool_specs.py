@@ -121,6 +121,57 @@ TOOL_SPECS = [
         },
     },
     {
+        "name": "get_area_profile",
+        "description": (
+            "동네(행정동) 프로필: 상권 유형(유흥/시장/대학·학원가/오피스/주거/관광·숙박/혼합)과 판정 근거, "
+            "업종 구성비와 대구 평균 비교, 업종 다양성 지수, 주민등록 인구·연령 구성, 전통시장·주차장, "
+            "그리고 같은 동네의 인허가 기반 지표(생존율·공실률·사이클). "
+            "'이 동네 어떤 곳이야?', '주변에 사는 사람은?', '무슨 상권이야?' 같은 질문에 사용. "
+            "상가정보는 2026-06 현재 영업 점포 단면이고, 시간 추세는 get_market_cycle 을 함께 보라."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "gu": _AREA["gu"],
+                "dong": {"type": "string", "description": "행정동(삼덕동, 범어3동, 다사읍) 또는 법정동(삼덕동1가). 법정동은 자동으로 행정동에 연결된다."},
+                "top_n": {"type": "integer", "default": 5},
+            },
+        },
+    },
+    {
+        "name": "find_nearby",
+        "description": (
+            "특정 자리 반경(기본 300m) 안의 현황: 전 업종 점포 수와 업종 구성, 같은 업종 경쟁 점포 수와 사례, "
+            "최근 공실 자리, 반복 폐업 자리, 주차장 규모, 1km 내 전통시장. "
+            "'이 자리 주변 경쟁은?', '근처에 빈 가게 있어?' 같은 질문에 사용."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "description": "중심이 될 주소 또는 상호 (예: '동성로5길 83')."},
+                "radius_m": {"type": "integer", "description": "반경(m). 기본 300.", "default": 300},
+                "category": {"type": "string", "description": "경쟁으로 셀 업종. " + _CATEGORY_DESC},
+                "limit": {"type": "integer", "default": 10},
+            },
+            "required": ["address"],
+        },
+    },
+    {
+        "name": "get_station_traffic",
+        "description": (
+            "대구 도시철도 역별 일평균 승하차 인원과 시간대 구성(아침·점심·저녁·심야 비중, 최대 시간대) — 유동인구 대리지표. "
+            "역 이름을 주면 그 역의 수치와 순위, 생략하면 이용객 상위 역 순위를 반환한다. "
+            "역 좌표가 없어 특정 주소와의 거리는 계산하지 못한다."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "station": {"type": "string", "description": "역 이름 (예: 반월당, 동대구역, 범어)."},
+                "top_n": {"type": "integer", "default": 10},
+            },
+        },
+    },
+    {
         "name": "normalize_address",
         "description": (
             "주소·상호 문자열을 분석 단위인 '자리'(건물 지번 + 층) 후보로 정규화하고 각 후보의 현재 상태(영업중/공백일수)를 반환. "
