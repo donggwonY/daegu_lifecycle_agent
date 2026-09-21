@@ -120,7 +120,14 @@ def _basis(**extra) -> dict:
     조건을 밝히며 답할 수 있고 없는 숫자를 지어낼 여지가 줄어든다.
     """
     s = store()
-    return {"data": "행정안전부 지방행정 인허가(대구 일반·휴게음식점)", "reference_date": s.meta["reference_date"], **extra}
+    return {"data": f"행정안전부 지방행정 인허가(대구 {_services_label()})",
+            "reference_date": s.meta["reference_date"], **extra}
+
+
+@lru_cache(maxsize=1)
+def _services_label() -> str:
+    """'일반음식점·휴게음식점·제과점영업' — 업종을 확장해도 안내 문구가 따라오도록 meta 에서 만든다."""
+    return "·".join(k for k in store().meta["records"] if k != "통합")
 
 
 def _resolve_area(gu: str | None = None, dong: str | None = None) -> tuple[str | None, list[str] | None, str]:
@@ -493,7 +500,7 @@ def find_vacant_units(gu: str | None = None, dong: str | None = None, previous_c
         "vacant_days_median": None if v.empty else int(v["vacant_days"].median()),
         "top_dongs": [{"gu": k[0], "dong": k[1], "count": int(c)} for k, c in by_dong.items()],
         "units": rows, "shown": len(rows),
-        "basis": _basis(definition=f"폐업 후 {min_days}~{max_days}일 동안 같은 자리에 일반·휴게음식점 신규 인허가가 없는 자리"
+        "basis": _basis(definition=f"폐업 후 {min_days}~{max_days}일 동안 같은 자리에 {_services_label()} 신규 인허가가 없는 자리"
                                    + (" (동시영업 1개 이하 단일 점포 자리만)" if single_unit_only else ""),
                         caveat="음식점 외 업종(소매·사무실 등)으로 전환됐을 수 있으므로 현장 확인 필요. 10년 이상 공백은 철거·주소변경 가능성이 커 기본 제외."),
     })
