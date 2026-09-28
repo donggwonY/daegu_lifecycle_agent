@@ -10,6 +10,7 @@ Gemini 에만 있는 것은 _generate() 의 모델 자동 대체다(무료 한�
 """
 from __future__ import annotations
 
+import time
 from typing import Iterator
 
 from google import genai
@@ -20,6 +21,9 @@ from agent import MAX_TOOL_ROUNDS, build_system_prompt, run_tool
 from core.tool_specs import TOOL_SPECS
 
 RETRY_NEXT_MODEL = (404, 429)  # 모델 없음 / 무료 한도 초과 → 다음 모델
+# 503(과부하)·500 등 서버 오류는 Google 쪽 일시적 문제라 잠깐 뒤 같은 모델로 다시 시도하면 대개 성공한다.
+# 그래도 안 되면 다음 모델로 넘어간다(모델마다 혼잡도가 다르다).
+SERVER_RETRY_DELAYS = (1.0, 3.0)
 
 
 def _tools() -> list[types.Tool]:
@@ -35,10 +39,11 @@ class GeminiAgent:
     provider = "gemini"
 
     def __init__(self, api_key: str | None = None, client: genai.Client | None = None,
-                 models: list[str] | None = None):
+                 models: list[str] | None = None, server_retry_delays: tuple[float, ...] = SERVER_RETRY_DELAYS):
         # api_key 를 명시적으로 넘긴다 — 공개 서버에서 os.environ 에 넣으면 모든 방문자가 공유하게 됨
         self.client = client or (genai.Client(api_key=api_key) if api_key else genai.Client())
         self.models = list(models or C.GEMINI_MODELS)
+        self.server_retry_delays = server_retry_delays  # 테스트에서는 () 로 넘겨 기다리지 않는다
         self.model_used: str | None = None
         self.config = types.GenerateContentConfig(
             system_instruction=build_system_prompt(),
@@ -52,21 +57,31 @@ class GeminiAgent:
         self.contents = []
 
     def _generate(self) -> types.GenerateContentResponse:
-        """모델 목록을 순서대로 시도한다. 404(없는 모델)·429(무료 한도)면 다음 모델로.
+        """모델 목록을 순서대로 시도한다.
 
+        404(없는 모델)·429(무료 한도) → 곧바로 다음 모델.
+        5xx(서버 과부하) → 같은 모델로 잠시 뒤 재시도하고, 그래도 실패하면 다음 모델.
         한 번 성공한 모델을 기억해 다음 호출에서 먼저 쓴다(대화 중간에 모델이 바뀌면 답변 톤이 달라지므로).
         """
         order = ([self.model_used] if self.model_used else []) + [m for m in self.models if m != self.model_used]
         last_error = None
         for model in order:
-            try:
-                response = self.client.models.generate_content(model=model, contents=self.contents, config=self.config)
-                self.model_used = model
-                return response
-            except errors.ClientError as e:
-                if e.code not in RETRY_NEXT_MODEL:
-                    raise
-                last_error = e
+            for delay in (0.0, *self.server_retry_delays):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    response = self.client.models.generate_content(
+                        model=model, contents=self.contents, config=self.config)
+                    self.model_used = model
+                    return response
+                except errors.ServerError as e:
+                    last_error = e          # 일시적 과부하 → 같은 모델로 다시
+                    continue
+                except errors.ClientError as e:
+                    if e.code not in RETRY_NEXT_MODEL:
+                        raise
+                    last_error = e
+                    break                   # 재시도해도 같은 결과 → 다음 모델
         raise last_error
 
     def ask(self, user_text: str) -> Iterator[dict]:
@@ -84,7 +99,8 @@ class GeminiAgent:
                 msg = f"Gemini API 오류 {e.code}: {e.message}"
             yield self._fail(checkpoint, msg)
         except errors.ServerError as e:
-            yield self._fail(checkpoint, f"Gemini 서버 오류({e.code}) — 잠시 후 다시 시도하세요.")
+            yield self._fail(checkpoint, f"Gemini 서버가 혼잡합니다({e.code}). 재시도와 다른 모델 전환까지 해봤지만 실패했습니다. "
+                                         "1~2분 뒤에 다시 질문해 주세요. (Google 쪽 일시적 과부하로, 데이터나 질문 문제는 아닙니다)")
         except errors.APIError as e:
             yield self._fail(checkpoint, f"Gemini API 오류: {e}")
 
