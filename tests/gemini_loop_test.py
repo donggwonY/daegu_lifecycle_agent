@@ -54,6 +54,28 @@ def test_tool_loop_and_model_fallback():
     assert "Tool 이 반환한 값만" in cfg.system_instruction
 
 
+def test_server_error_retries_then_switches_model():
+    """503(과부하)은 같은 모델로 재시도하고, 그래도 안 되면 다음 모델로 넘어간다."""
+    overloaded = errors.ServerError(503, {"error": {"code": 503, "message": "The model is overloaded.",
+                                                    "status": "UNAVAILABLE"}})
+    fake = FakeModels([overloaded, overloaded, overloaded,   # model-a: 최초 + 재시도 2회 모두 실패
+                       reply(types.Part(text="수성구 카페 중앙생존은 ..."))])  # model-b 에서 성공
+    agent = GeminiAgent(client=NS(models=fake), models=["model-a", "model-b"], server_retry_delays=(0, 0))
+    events = list(agent.ask("수성구 카페 어때?"))
+    assert [c["model"] for c in fake.calls] == ["model-a", "model-a", "model-a", "model-b"]
+    assert events[-1]["type"] == "done" and events[-1]["model"] == "model-b"
+
+
+def test_server_error_all_models_fail():
+    """모든 모델이 503이면 사용자에게 안내하고 이력을 되돌린다."""
+    overloaded = errors.ServerError(503, {"error": {"code": 503, "message": "overloaded", "status": "UNAVAILABLE"}})
+    fake = FakeModels([overloaded] * 6)
+    agent = GeminiAgent(client=NS(models=fake), models=["model-a", "model-b"], server_retry_delays=(0, 0))
+    events = list(agent.ask("질문"))
+    assert events[-1]["type"] == "error" and "혼잡" in events[-1]["message"], events
+    assert agent.contents == []
+
+
 def test_error_rolls_back_history():
     fake = FakeModels([errors.ClientError(400, {"error": {"code": 400, "message": "API key not valid", "status": "INVALID_ARGUMENT"}})])
     agent = GeminiAgent(client=NS(models=fake), models=["model-a"])
@@ -64,5 +86,7 @@ def test_error_rolls_back_history():
 
 if __name__ == "__main__":
     test_tool_loop_and_model_fallback()
+    test_server_error_retries_then_switches_model()
+    test_server_error_all_models_fail()
     test_error_rolls_back_history()
     print("gemini loop OK")
