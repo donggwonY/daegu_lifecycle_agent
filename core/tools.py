@@ -180,7 +180,7 @@ def _area_mask(df: pd.DataFrame, g, d) -> pd.Series:
 
 
 def _resolve_category(text: str | None) -> tuple[str | None, list[str] | None, str]:
-    """반환: (service, categories, label). 업종명(일반/휴게음식점)과 업태·별칭 모두 허용.
+    """반환: (service, categories, label). 업종명(config.SERVICES)과 업태·별칭 모두 허용.
 
     "카페"처럼 데이터에 없는 일상어는 config.CATEGORY_ALIASES 로 실제 업태 여러 개(커피숍·까페·다방…)에 매핑한다.
     label 은 "카페(커피숍, 까페, 다방)"처럼 무엇을 합쳤는지 사용자에게 밝히기 위한 문자열이다.
@@ -217,10 +217,23 @@ def _years(days) -> float | None:
     return None if days is None or pd.isna(days) else round(float(days) / YEAR, 1)
 
 
+SHORT_LIVED_DAYS = 30
+SHORT_LIVED_WARN_PCT = 10
+
+
 def _survival(frame: pd.DataFrame, curve=True) -> dict:
     out = summarize(frame["dur_days"], frame["closed"])
     if out["median_survival_years"] is None and out["n"]:
         out["median_note"] = "관측기간 내 생존율이 50% 아래로 떨어지지 않음(중앙생존기간 추정 불가)"
+    # 백화점 팝업·행사 매장은 며칠 만에 인허가가 끝나 생존율을 끌어내린다.
+    # 비중이 크면 숫자와 함께 알려 AI 가 "1년 생존율이 낮다"를 단정하지 않게 한다.
+    closed = frame[frame["closed"]]
+    if len(closed):
+        pct = round(float((closed["dur_days"] <= SHORT_LIVED_DAYS).mean() * 100), 1)
+        out["short_lived_closures_pct"] = pct
+        if pct >= SHORT_LIVED_WARN_PCT:
+            out["short_lived_note"] = (f"폐업의 {pct}%가 {SHORT_LIVED_DAYS}일 이내 — 백화점 팝업·행사 매장이 섞여 "
+                                       "생존율이 실제 상설 점포보다 낮게 보일 수 있음")
     if not curve:
         out.pop("curve")
     return out
@@ -471,10 +484,11 @@ def get_market_cycle(gu: str | None = None, dong: str | None = None, years: int 
 def find_vacant_units(gu: str | None = None, dong: str | None = None, previous_category: str | None = None,
                       min_days: int = C.VACANCY_MIN_DAYS, max_days: int = C.VACANCY_MAX_DAYS,
                       single_unit_only: bool = True, sort: str = "recent", limit: int = 20) -> dict:
-    """최근 공실(폐업 후 신규 음식점 인허가가 없는 자리) 목록 + 좌표 + 지속일수.
+    """최근 공실(폐업 후 같은 자리에 신규 인허가가 없음) 목록 + 좌표 + 지속일수.
 
-    '공실'은 어디까지나 인허가 공백이다. 소매점·사무실로 바뀌었을 수도 있어서
-    basis.caveat 에 "현장 확인 필요"를 함께 실어 AI 가 단정하지 않게 한다.
+    '공실'은 어디까지나 '분석 대상 업종의 인허가 공백'이다. 분석에 포함하지 않은 업종으로
+    바뀌었을 수도 있어서 basis.caveat 에 "현장 확인 필요"를 함께 실어 AI 가 단정하지 않게 한다.
+    업종을 넓힐수록(config.SERVICES) 이 오판이 줄어든다 — 기획서 문제4.
     """
     s = store()
     g, d, label = _resolve_area(gu, dong)
@@ -502,7 +516,8 @@ def find_vacant_units(gu: str | None = None, dong: str | None = None, previous_c
         "units": rows, "shown": len(rows),
         "basis": _basis(definition=f"폐업 후 {min_days}~{max_days}일 동안 같은 자리에 {_services_label()} 신규 인허가가 없는 자리"
                                    + (" (동시영업 1개 이하 단일 점포 자리만)" if single_unit_only else ""),
-                        caveat="음식점 외 업종(소매·사무실 등)으로 전환됐을 수 있으므로 현장 확인 필요. 10년 이상 공백은 철거·주소변경 가능성이 커 기본 제외."),
+                        caveat=f"분석 대상({_services_label()}) 외 업종으로 전환됐을 수 있으므로 현장 확인 필요. "
+                               "10년 이상 공백은 철거·주소변경 가능성이 커 기본 제외."),
     })
 
 

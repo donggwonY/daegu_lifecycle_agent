@@ -37,8 +37,9 @@ from core import address as A  # noqa: E402
 from core.cycle import classify_stage  # noqa: E402
 from core.survival import YEAR, summarize  # noqa: E402
 
+# 업종마다 열 구성이 다르다(음식점 39열, 담배소매업 24열 …). 없는 열은 적재 후 빈 값으로 채운다.
 USECOLS = [
-    "개방자치단체코드", "관리번호", "인허가일자", "영업상태명", "폐업일자", "소재지면적",
+    "개방자치단체코드", "관리번호", "인허가일자", "영업상태명", "폐업일자", "인허가취소일자", "소재지면적",
     "사업장명", "업태구분명", "위생업태명", "데이터갱신구분", "도로명주소", "지번주소",
     "좌표정보(X)", "좌표정보(Y)", "최종수정시점", "데이터갱신시점",
 ]
@@ -54,7 +55,7 @@ def load_raw() -> tuple[pd.DataFrame, dict]:
     """data/raw 의 CSV 를 모두 읽어 한 장의 표로 합치고 중복을 제거한다."""
     frames = []
     for path in sorted(C.RAW_DIR.rglob("*.csv")):
-        # 업종은 파일명으로 구분한다. 그래서 파일 이름에 "일반음식점"/"휴게음식점"이 들어가야 한다.
+        # 업종은 파일명으로 구분한다. config.SERVICES 의 이름이 파일명에 들어 있어야 한다.
         service = next((s for s in C.SERVICES if s in path.name), None)
         if service is None:
             log(f"  건너뜀(업종 미식별): {path.name}")
@@ -63,8 +64,11 @@ def load_raw() -> tuple[pd.DataFrame, dict]:
         # (pandas 가 알아서 추측하게 두면 '0061-0003' 같은 번지가 숫자로 바뀌는 사고가 난다).
         df = pd.read_csv(path, encoding="cp949", encoding_errors="replace", dtype=str,
                          usecols=lambda c: c in USECOLS)  # 39개 열 중 쓰는 16개만
+        for col in USECOLS:  # 이 업종 파일에 없는 열은 빈 값으로 만들어 이후 처리를 단순화한다
+            if col not in df.columns:
+                df[col] = pd.NA
         df["service"] = service
-        df["service_id"] = C.SERVICES[service]
+        df["service_id"] = service  # 고유키 구성요소 (업종 하나당 파일 하나)
         frames.append(df)
         log(f"  {path.name}: {len(df):,}행")
     if not frames:
@@ -85,11 +89,17 @@ def clean(df: pd.DataFrame, quality: dict) -> tuple[pd.DataFrame, pd.Timestamp]:
     반환하는 ref(기준일)가 이후 모든 계산의 '오늘'이다. 실행 날짜가 아니라 데이터의 최신 날짜를 쓴다.
     """
     df["ld"] = pd.to_datetime(df["인허가일자"], errors="coerce")  # ld = license date(개업)
-    df["cd"] = pd.to_datetime(df["폐업일자"], errors="coerce")    # cd = close date(폐업), 영업 중이면 NaT
+    # cd = close date. 담배소매업·노래연습장업처럼 '인허가취소일자'로 종료를 기록하는 업종이 있어 함께 본다.
+    df["cd"] = pd.to_datetime(df["폐업일자"], errors="coerce").fillna(
+        pd.to_datetime(df["인허가취소일자"], errors="coerce"))
     # '폐업' 외에 '취소', '말소'도 영업 종료로 본다
     df["closed"] = df["영업상태명"].fillna("").str.contains("폐업|취소|말소")
 
     quality["missing_license_date"] = int(df["ld"].isna().sum())
+    # 1900-01-01 같은 명백한 입력 오류 (담배소매업에서 4건 확인). 데이터 개방은 1960년대부터다.
+    too_old = df["ld"].dt.year < 1960
+    quality["license_date_before_1960"] = int(too_old.sum())
+    df.loc[too_old, "ld"] = pd.NaT
     quality["closed_without_close_date"] = int((df["closed"] & df["cd"].isna()).sum())
     quality["date_contradiction"] = int((df["cd"] < df["ld"]).sum())
 
@@ -104,8 +114,12 @@ def clean(df: pd.DataFrame, quality: dict) -> tuple[pd.DataFrame, pd.Timestamp]:
     # 기준일 = 데이터에 등장하는 가장 늦은 날짜. 배치를 언제 돌리든 같은 데이터면 같은 결과가 나온다.
     ref = max(df["ld"].max(), df["cd"].max()).normalize()
 
-    df["category"] = (df["업태구분명"].fillna("").str.strip()
-                      .replace("", np.nan).fillna(df["위생업태명"]).fillna("기타").str.strip())
+    # 업태: 업태구분명 → 위생업태명 → (둘 다 없는 업종은) 업종명 자체.
+    # 담배소매업·노래연습장업은 업태 구분이 없어 업종명이 곧 업태가 된다.
+    df["category"] = (df["업태구분명"].astype("string").fillna("").str.strip()
+                      .replace("", pd.NA)
+                      .fillna(df["위생업태명"].astype("string").str.strip())
+                      .fillna(df["service"]).astype(str).str.strip())
     df["name"] = df["사업장명"].fillna("").str.strip()
     # 영업 종료일: 폐업했으면 폐업일, 영업 중이면 기준일(= 여기서 관측을 끊는다 → 생존분석의 '중도절단')
     df["end"] = df["cd"].where(df["closed"], ref)
