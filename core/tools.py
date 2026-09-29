@@ -217,10 +217,23 @@ def _years(days) -> float | None:
     return None if days is None or pd.isna(days) else round(float(days) / YEAR, 1)
 
 
+SHORT_LIVED_DAYS = 30
+SHORT_LIVED_WARN_PCT = 10
+
+
 def _survival(frame: pd.DataFrame, curve=True) -> dict:
     out = summarize(frame["dur_days"], frame["closed"])
     if out["median_survival_years"] is None and out["n"]:
         out["median_note"] = "관측기간 내 생존율이 50% 아래로 떨어지지 않음(중앙생존기간 추정 불가)"
+    # 백화점 팝업·행사 매장은 며칠 만에 인허가가 끝나 생존율을 끌어내린다.
+    # 비중이 크면 숫자와 함께 알려 AI 가 "1년 생존율이 낮다"를 단정하지 않게 한다.
+    closed = frame[frame["closed"]]
+    if len(closed):
+        pct = round(float((closed["dur_days"] <= SHORT_LIVED_DAYS).mean() * 100), 1)
+        out["short_lived_closures_pct"] = pct
+        if pct >= SHORT_LIVED_WARN_PCT:
+            out["short_lived_note"] = (f"폐업의 {pct}%가 {SHORT_LIVED_DAYS}일 이내 — 백화점 팝업·행사 매장이 섞여 "
+                                       "생존율이 실제 상설 점포보다 낮게 보일 수 있음")
     if not curve:
         out.pop("curve")
     return out
