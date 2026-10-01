@@ -9,14 +9,23 @@
 
 ## 빠른 시작
 
-```bash
+배포(Streamlit Cloud)와 같은 **Python 3.12 + 고정 버전**으로 돌리기 위해 가상환경 `.venv` 를 만들어 그 안에서만 실행한다.
+시스템 `python` 으로 바로 돌리면 패키지 버전이 달라 로컬 결과가 배포와 같다고 보장할 수 없다.
+
+```powershell
+py -3.12 -m venv .venv                # 최초 1회. Python 3.12 가 없으면 먼저 설치
+.venv\Scripts\Activate.ps1            # 터미널을 열 때마다 (macOS·Linux: source .venv/bin/activate)
 pip install -r requirements-dev.txt   # 웹만 돌릴 땐 requirements.txt
+
 python -m pipeline.build          # 인허가 배치(약 40초) → data/processed
 python -m pipeline.external       # 보조 데이터 배치(약 10초) → 상가정보·인구·지하철·주차장·전통시장
 python -m unittest tests.test_core_units   # 주소 정규화·사이클 판정 단위 테스트 (데이터 불필요)
-python -m tests.smoke_test        # Tool 8종 점검 (API 키 불필요)
+python -m tests.smoke_test        # Tool 11종 점검 (API 키 불필요)
 streamlit run app.py              # 웹 UI
 ```
+
+패키지 버전은 `requirements.txt`·`requirements-dev.txt` 에 `==` 로 고정돼 있다. 올릴 때는 `.venv` 에서 위 테스트를 다시 통과시킨 뒤 바꾼다.
+야간 배치 `run_batch.ps1` 도 `.venv` 의 Python 만 쓰고, 종료 코드를 로그에 남긴다.
 
 - **AI 상담** 탭은 LLM API 키가 필요하다. 기본은 **Google Gemini 무료 등급**(`LLM_PROVIDER="gemini"`), 설정 하나로 Claude 로 전환.
   키는 `.streamlit/secrets.toml`(예: `secrets.toml.example`) 또는 환경변수 `GEMINI_API_KEY` 에 두거나, 비워 두면 방문자가 사이드바에 자기 키를 입력한다.
@@ -49,7 +58,7 @@ Claude Desktop 앱이 claude.ai 계정으로 대화를 처리하고, 이 프로�
 {
   "mcpServers": {
     "daegu-lifecycle": {
-      "command": "python",
+      "command": "C:\\claude_workspace\\daegu_lifecycle_agent\\.venv\\Scripts\\python.exe",
       "args": ["C:\\claude_workspace\\daegu_lifecycle_agent\\mcp_server.py"],
       "env": { "PYTHONIOENCODING": "utf-8" }
     }
