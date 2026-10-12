@@ -1,6 +1,13 @@
 # 상권 생애주기 추론 AI 에이전트 (대구)
 
-### ▶ [웹앱 바로가기 — daegulifecycleagent.streamlit.app](https://daegulifecycleagent.streamlit.app)
+> **이 프로젝트는 2026-10-11에 [PublicData_AI_Agent](https://github.com/donggwonY/PublicData_AI_Agent)의 [`service/`](https://github.com/donggwonY/PublicData_AI_Agent/tree/main/service) 폴더로 이전했습니다.**
+>
+> - 최신 코드와 개발: [donggwonY/PublicData_AI_Agent](https://github.com/donggwonY/PublicData_AI_Agent)
+> - 공식 웹앱: **[pubdai.streamlit.app](https://pubdai.streamlit.app)**
+>
+> 이 저장소와 아래 웹앱은 이전 시점(커밋 1932844)의 상태로 남겨 둔 것이며, 이후 변경은 반영되지 않습니다.
+
+### ▶ [이전 시점 웹앱 — daegulifecycleagent.streamlit.app](https://daegulifecycleagent.streamlit.app)
 
 대구에서 창업하려는 사람에게 **그 자리의 과거를 데이터로 확인시켜주는** 대화형 AI 에이전트.
 행정안전부 지방행정 인허가 데이터(대구 7개 업종 197,356건)를 주소로 묶고 시간순으로 정렬해
